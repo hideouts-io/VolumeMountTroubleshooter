@@ -2,6 +2,10 @@
 
 ### Transparent, non-destructive volume detection and mounting for Apple Silicon Macs
 
+<p align="center">
+  <img src="assets/AppIcon.png" width="260" alt="Volume Mount Troubleshooter logo">
+</p>
+
 ![Platform](https://img.shields.io/badge/platform-macOS-000000?logo=apple&logoColor=white)
 ![Architecture](https://img.shields.io/badge/architecture-Apple%20Silicon-8250df)
 ![Swift](https://img.shields.io/badge/Swift-5%20language%20mode-F05138?logo=swift&logoColor=white)
@@ -537,6 +541,8 @@ Read-only mount, writable-volume unmount/remount, Safe Eject, and physical hot-p
 ```text
 VolumeMountTroubleshooter/
 ├── AppDelegate.swift       # AppKit window, controls, actions, and workflow
+├── assets/AppIcon.png      # Canonical project logo source
+├── assets/AppIcon.icns     # Multi-resolution macOS application icon
 ├── Diagnostics.swift       # Typed models, plist decoding, redaction, guidance
 ├── SystemConnectors.swift  # Process, disk scanner, Disk Arbitration monitor
 ├── main.swift              # Application entry point and test modes

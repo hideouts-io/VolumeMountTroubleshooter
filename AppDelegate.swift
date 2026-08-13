@@ -85,6 +85,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         selectorLabel.font = NSFont.systemFont(ofSize: 13, weight: .medium)
 
         let volumePopup = NSPopUpButton()
+        volumePopup.addItem(withTitle: "Scanning for external volumes…")
+        volumePopup.isEnabled = false
         volumePopup.target = self
         volumePopup.action = #selector(volumeSelectionChanged)
         self.volumePopup = volumePopup

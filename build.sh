@@ -7,9 +7,10 @@ build_dir="$project_dir/build"
 app_dir="$build_dir/Volume Mount Troubleshooter.app"
 contents_dir="$app_dir/Contents"
 macos_dir="$contents_dir/MacOS"
+resources_dir="$contents_dir/Resources"
 
 /bin/rm -rf "$app_dir"
-/bin/mkdir -p "$macos_dir"
+/bin/mkdir -p "$macos_dir" "$resources_dir"
 
 /usr/bin/xcrun swiftc \
   -swift-version 5 \
@@ -25,6 +26,7 @@ macos_dir="$contents_dir/MacOS"
   -o "$macos_dir/VolumeMountTroubleshooter"
 
 /bin/cp "$project_dir/Info.plist" "$contents_dir/Info.plist"
+/bin/cp "$project_dir/assets/AppIcon.icns" "$resources_dir/AppIcon.icns"
 "$macos_dir/VolumeMountTroubleshooter" --self-test
 /usr/bin/codesign --force --sign - --timestamp=none "$app_dir"
 /usr/bin/codesign --verify --deep --strict --verbose=2 "$app_dir"

@@ -41,6 +41,13 @@ struct VolumeMountTroubleshooterApplication {
         }
 
         let application = NSApplication.shared
+        guard
+            let iconPath = Bundle.main.path(forResource: "AppIcon", ofType: "icns"),
+            let applicationIcon = NSImage(contentsOfFile: iconPath)
+        else {
+            fatalError("AppIcon.icns is missing or unreadable in the application bundle")
+        }
+        application.applicationIconImage = applicationIcon
         let delegate = AppDelegate()
         application.setActivationPolicy(.regular)
         application.delegate = delegate
