@@ -17,6 +17,10 @@ macos_dir="$contents_dir/MacOS"
   -O \
   -target "arm64-apple-macos13.0" \
   -framework AppKit \
+  -framework DiskArbitration \
+  "$project_dir/Diagnostics.swift" \
+  "$project_dir/SystemConnectors.swift" \
+  "$project_dir/AppDelegate.swift" \
   "$project_dir/main.swift" \
   -o "$macos_dir/VolumeMountTroubleshooter"
 
