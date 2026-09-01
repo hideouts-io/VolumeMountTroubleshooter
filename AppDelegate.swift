@@ -6,27 +6,38 @@ import UniformTypeIdentifiers
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private let runner = CommandRunner()
     private let scanRunner = CommandRunner()
-    private var diskMonitor: DiskArrivalMonitor?
+    private let unlockRetryLimit = 5
+    private let unlockRetryDelay: TimeInterval = 2
+    private var diskMonitor: DiskEventMonitor?
     private var refreshWorkItem: DispatchWorkItem?
-    private var snapshot = DiskSnapshot(disks: [], notices: [])
+    private var unlockRetryWorkItem: DispatchWorkItem?
+    private var snapshot = DiskSnapshot(disks: [], unlockers: [])
     private var window: NSWindow?
     private var textView: NSTextView?
     private var statusLabel: NSTextField?
     private var volumePopup: NSPopUpButton?
     private var volumeDetailLabel: NSTextField?
+    private var unlockProgressLabel: NSTextField?
     private var readOnlyCheckbox: NSButton?
     private var redactCheckbox: NSButton?
     private var startButton: NSButton?
     private var stopButton: NSButton?
     private var refreshButton: NSButton?
     private var ejectButton: NSButton?
+    private var showUnlockerButton: NSButton?
     private var copyButton: NSButton?
     private var saveButton: NSButton?
     private var revealButton: NSButton?
     private var completeLog = ""
     private var isRunning = false
     private var isRefreshing = false
+    private var scanGeneration = 0
     private var automaticRefreshPending = false
+    private var selectionRequiresUserChoice = false
+    private var unlockRetryAttempt = 0
+    private var trackedUnlocker: VirtualUnlocker?
+    private var readyUnlockVolumeIdentifier: String?
+    private var lastUnlockProgressMessage: String?
     private var postRefreshStatus: (message: String, color: NSColor)?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -107,6 +118,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         volumeDetailLabel.font = NSFont.systemFont(ofSize: 12)
         self.volumeDetailLabel = volumeDetailLabel
 
+        let unlockProgressLabel = NSTextField(wrappingLabelWithString: "")
+        unlockProgressLabel.font = NSFont.systemFont(ofSize: 12, weight: .medium)
+        unlockProgressLabel.textColor = .systemOrange
+        unlockProgressLabel.isHidden = true
+        self.unlockProgressLabel = unlockProgressLabel
+
         let readOnlyCheckbox = NSButton(checkboxWithTitle: "Mount read-only", target: self, action: nil)
         readOnlyCheckbox.state = .on
         self.readOnlyCheckbox = readOnlyCheckbox
@@ -140,6 +157,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         ejectButton.isEnabled = false
         self.ejectButton = ejectButton
 
+        let showUnlockerButton = NSButton(
+            title: "Show Unlocker in Finder",
+            target: self,
+            action: #selector(showUnlockerInFinder)
+        )
+        showUnlockerButton.bezelStyle = .rounded
+        showUnlockerButton.identifier = NSUserInterfaceItemIdentifier("showUnlockerInFinderButton")
+        showUnlockerButton.isEnabled = false
+        showUnlockerButton.isHidden = true
+        self.showUnlockerButton = showUnlockerButton
+
         let copyButton = NSButton(title: "Copy Report", target: self, action: #selector(copyLog))
         copyButton.bezelStyle = .rounded
         copyButton.isEnabled = false
@@ -154,7 +182,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         revealButton.bezelStyle = .rounded
         self.revealButton = revealButton
 
-        let buttonStack = NSStackView(views: [startButton, stopButton, ejectButton, copyButton, saveButton, revealButton])
+        let buttonStack = NSStackView(views: [
+            startButton,
+            stopButton,
+            ejectButton,
+            showUnlockerButton,
+            copyButton,
+            saveButton,
+            revealButton
+        ])
         buttonStack.orientation = .horizontal
         buttonStack.spacing = 8
         buttonStack.alignment = .centerY
@@ -182,6 +218,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             subtitleLabel,
             selectorStack,
             volumeDetailLabel,
+            unlockProgressLabel,
             optionStack,
             statusLabel,
             buttonStack,
@@ -193,7 +230,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         contentStack.translatesAutoresizingMaskIntoConstraints = false
         rootView.addSubview(contentStack)
 
-        [titleLabel, subtitleLabel, selectorStack, volumeDetailLabel, optionStack, statusLabel, buttonStack, scrollView].forEach {
+        [
+            titleLabel,
+            subtitleLabel,
+            selectorStack,
+            volumeDetailLabel,
+            unlockProgressLabel,
+            optionStack,
+            statusLabel,
+            buttonStack,
+            scrollView
+        ].forEach {
             $0.translatesAutoresizingMaskIntoConstraints = false
         }
 
@@ -206,6 +253,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             subtitleLabel.widthAnchor.constraint(equalTo: contentStack.widthAnchor),
             selectorStack.widthAnchor.constraint(equalTo: contentStack.widthAnchor),
             volumeDetailLabel.widthAnchor.constraint(equalTo: contentStack.widthAnchor),
+            unlockProgressLabel.widthAnchor.constraint(equalTo: contentStack.widthAnchor),
             optionStack.widthAnchor.constraint(equalTo: contentStack.widthAnchor),
             statusLabel.widthAnchor.constraint(equalTo: contentStack.widthAnchor),
             buttonStack.widthAnchor.constraint(lessThanOrEqualTo: contentStack.widthAnchor),
@@ -218,9 +266,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func startDiskMonitoring() {
-        let monitor = DiskArrivalMonitor { [weak self] _ in
+        let monitor = DiskEventMonitor { [weak self] event in
             DispatchQueue.main.async {
-                self?.scheduleAutomaticRefresh()
+                self?.handleDiskArbitrationEvent(event)
             }
         }
         do {
@@ -228,6 +276,95 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             diskMonitor = monitor
         } catch {
             appendLog("AUTOMATIC DETECTION WARNING: \(error.localizedDescription)\n")
+        }
+    }
+
+    private func handleDiskArbitrationEvent(_ event: DiskArbitrationEvent) {
+        switch event {
+        case .appeared:
+            scheduleAutomaticRefresh()
+        case let .disappeared(identifier):
+            handleDiskDisappearance(identifier: identifier)
+        }
+    }
+
+    private func handleDiskDisappearance(identifier: String) {
+        let selectedIdentifier = selectedVolume()?.identifier
+        let selectedWasRemoved = selectedIdentifier.map {
+            deviceIdentifier($0, isSameAsOrDescendantOf: identifier)
+        } ?? false
+        let scanWasRunning = isRefreshing
+        let updatedSnapshot = snapshot.removingDevice(identifier: identifier)
+        let trackedUnlockerWasRemoved = trackedUnlocker.map { unlocker in
+            !updatedSnapshot.unlockers.contains(unlocker)
+        } ?? false
+        if selectedWasRemoved {
+            selectionRequiresUserChoice = true
+        }
+
+        scanGeneration += 1
+        if scanWasRunning {
+            automaticRefreshPending = true
+            scanRunner.cancel()
+        }
+
+        snapshot = updatedSnapshot
+        renderSelectorAfterDisappearance(
+            previouslySelectedIdentifier: selectedIdentifier,
+            selectedWasRemoved: selectedWasRemoved
+        )
+        if trackedUnlockerWasRemoved {
+            clearUnlockTransition()
+        } else {
+            updateUnlockTransition()
+        }
+        updateSelectionDetails()
+        setControlsForRunningState(isRunning)
+        setStatus("Disconnected /dev/\(identifier) — stale selection cleared", color: .systemOrange)
+        appendLog("AUTO-DETECT: /dev/\(identifier) disappeared; its stale selector entry was removed immediately.\n")
+
+        if !scanWasRunning {
+            scheduleAutomaticRefresh()
+        }
+    }
+
+    private func renderSelectorAfterDisappearance(
+        previouslySelectedIdentifier: String?,
+        selectedWasRemoved: Bool
+    ) {
+        volumePopup?.removeAllItems()
+        if selectedWasRemoved {
+            let placeholder = snapshot.volumes.isEmpty
+                ? "No external volumes detected"
+                : "Select another external volume"
+            volumePopup?.addItem(withTitle: placeholder)
+            volumePopup?.lastItem?.tag = -1
+        }
+        addCurrentVolumeItemsToPopup()
+
+        if
+            !selectedWasRemoved,
+            let previouslySelectedIdentifier,
+            let item = volumePopup?.itemArray.first(where: { item in
+                let tag = item.tag
+                return snapshot.volumes.indices.contains(tag)
+                    && snapshot.volumes[tag].identifier == previouslySelectedIdentifier
+            })
+        {
+            volumePopup?.select(item)
+        } else if selectedWasRemoved {
+            volumePopup?.selectItem(at: 0)
+        } else if snapshot.volumes.isEmpty {
+            volumePopup?.addItem(withTitle: "No external volumes detected")
+            volumePopup?.lastItem?.tag = -1
+            volumePopup?.selectItem(at: 0)
+        }
+    }
+
+    private func addCurrentVolumeItemsToPopup() {
+        for (index, volume) in snapshot.volumes.enumerated() {
+            volumePopup?.addItem(withTitle: volumeMenuTitle(volume))
+            volumePopup?.lastItem?.tag = index
         }
     }
 
@@ -245,6 +382,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func refreshPressed() {
+        unlockRetryAttempt = 0
+        unlockRetryWorkItem?.cancel()
+        unlockRetryWorkItem = nil
         refreshVolumes(automatic: false)
     }
 
@@ -264,6 +404,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if automatic {
             automaticRefreshPending = false
         }
+        scanGeneration += 1
+        let currentScanGeneration = scanGeneration
         isRefreshing = true
         refreshButton?.isEnabled = false
         setStatus(automatic ? "Checking for attached volumes…" : "Refreshing external volumes…", color: .systemBlue)
@@ -276,7 +418,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             do {
                 let newSnapshot = try scanner.scan { _ in }
                 DispatchQueue.main.async {
-                    self?.applySnapshot(
+                    guard let self else {
+                        return
+                    }
+                    guard self.scanGeneration == currentScanGeneration else {
+                        self.finishSupersededScan()
+                        return
+                    }
+                    self.applySnapshot(
                         newSnapshot,
                         selectedIdentifier: selectedIdentifier,
                         previousIdentifiers: previousIdentifiers,
@@ -285,14 +434,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
             } catch {
                 DispatchQueue.main.async {
-                    self?.isRefreshing = false
-                    self?.refreshButton?.isEnabled = true
-                    self?.setStatus("Volume scan failed: \(error.localizedDescription)", color: .systemRed)
-                    self?.appendLog("SCAN FAILURE: \(error.localizedDescription)\n")
-                    self?.runPendingAutomaticRefreshIfNeeded()
+                    guard let self else {
+                        return
+                    }
+                    guard self.scanGeneration == currentScanGeneration else {
+                        self.finishSupersededScan()
+                        return
+                    }
+                    self.isRefreshing = false
+                    self.refreshButton?.isEnabled = true
+                    self.setStatus("Volume scan failed: \(error.localizedDescription)", color: .systemRed)
+                    self.appendLog("SCAN FAILURE: \(error.localizedDescription)\n")
+                    self.updateUnlockTransition()
+                    self.setControlsForRunningState(self.isRunning)
+                    self.runPendingAutomaticRefreshIfNeeded()
                 }
             }
         }
+    }
+
+    private func finishSupersededScan() {
+        isRefreshing = false
+        refreshButton?.isEnabled = true
+        setControlsForRunningState(isRunning)
+        runPendingAutomaticRefreshIfNeeded()
     }
 
     private func applySnapshot(
@@ -303,20 +468,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     ) {
         snapshot = newSnapshot
         volumePopup?.removeAllItems()
-
-        for (index, volume) in newSnapshot.volumes.enumerated() {
-            volumePopup?.addItem(withTitle: volumeMenuTitle(volume))
-            volumePopup?.lastItem?.tag = index
-        }
-
-        if let selectedIdentifier, let index = newSnapshot.volumes.firstIndex(where: { $0.identifier == selectedIdentifier }) {
-            volumePopup?.selectItem(at: index)
-        } else if !newSnapshot.volumes.isEmpty {
+        if selectionRequiresUserChoice, !newSnapshot.volumes.isEmpty {
+            volumePopup?.addItem(withTitle: "Select an external volume")
+            volumePopup?.lastItem?.tag = -1
+            addCurrentVolumeItemsToPopup()
             volumePopup?.selectItem(at: 0)
+        } else {
+            addCurrentVolumeItemsToPopup()
+            if
+                let selectedIdentifier,
+                let item = volumePopup?.itemArray.first(where: { item in
+                    let tag = item.tag
+                    return newSnapshot.volumes.indices.contains(tag)
+                        && newSnapshot.volumes[tag].identifier == selectedIdentifier
+                })
+            {
+                volumePopup?.select(item)
+            } else if !newSnapshot.volumes.isEmpty {
+                volumePopup?.selectItem(at: 0)
+            } else {
+                volumePopup?.addItem(withTitle: "No external volumes detected")
+                volumePopup?.lastItem?.tag = -1
+                volumePopup?.selectItem(at: 0)
+            }
         }
 
         isRefreshing = false
         refreshButton?.isEnabled = true
+        updateUnlockTransition()
         updateSelectionDetails()
         if let postRefreshStatus {
             setStatus(postRefreshStatus.message, color: postRefreshStatus.color)
@@ -338,6 +517,122 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         runPendingAutomaticRefreshIfNeeded()
     }
 
+    private func updateUnlockTransition() {
+        unlockRetryWorkItem?.cancel()
+        unlockRetryWorkItem = nil
+
+        if let detectedUnlocker = snapshot.unlockers.first {
+            let isNewUnlocker = trackedUnlocker?.deviceTreePath != detectedUnlocker.deviceTreePath
+                || trackedUnlocker?.wholeDiskIdentifier != detectedUnlocker.wholeDiskIdentifier
+            trackedUnlocker = detectedUnlocker
+            if isNewUnlocker {
+                unlockRetryAttempt = 0
+                readyUnlockVolumeIdentifier = nil
+                lastUnlockProgressMessage = nil
+                setUnlockProgress(.detected, color: .systemOrange)
+            }
+        }
+
+        guard let trackedUnlocker else {
+            clearUnlockTransitionUI()
+            return
+        }
+
+        if let readyVolume = snapshot.dataVolume(matching: trackedUnlocker) {
+            readyUnlockVolumeIdentifier = readyVolume.identifier
+            setUnlockProgress(.ready(volumeName: readyVolume.name), color: .systemGreen)
+            updateShowUnlockerButton()
+            return
+        }
+
+        let relatedDiskStillPresent = snapshot.disks.contains { disk in
+            guard let deviceTreePath = nonEmpty(trackedUnlocker.deviceTreePath) else {
+                return false
+            }
+            return disk.deviceTreePath == deviceTreePath
+        }
+        if readyUnlockVolumeIdentifier != nil, snapshot.unlockers.isEmpty, !relatedDiskStillPresent {
+            clearUnlockTransition()
+            return
+        }
+
+        readyUnlockVolumeIdentifier = nil
+        if unlockRetryAttempt >= unlockRetryLimit {
+            setUnlockProgress(.exhausted(limit: unlockRetryLimit), color: .systemRed)
+            updateShowUnlockerButton()
+            return
+        }
+
+        if unlockRetryAttempt == 0 {
+            setUnlockProgress(.waiting, color: .systemOrange)
+        }
+        updateShowUnlockerButton()
+        scheduleNextUnlockRetry()
+    }
+
+    private func scheduleNextUnlockRetry() {
+        guard trackedUnlocker != nil, unlockRetryAttempt < unlockRetryLimit else {
+            return
+        }
+        let nextAttempt = unlockRetryAttempt + 1
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self, self.trackedUnlocker != nil else {
+                return
+            }
+            self.unlockRetryWorkItem = nil
+            self.unlockRetryAttempt = nextAttempt
+            self.setUnlockProgress(
+                .retry(attempt: nextAttempt, limit: self.unlockRetryLimit),
+                color: .systemOrange
+            )
+            self.refreshVolumes(automatic: true)
+        }
+        unlockRetryWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + unlockRetryDelay, execute: workItem)
+    }
+
+    private func setUnlockProgress(_ phase: UnlockTransitionPhase, color: NSColor) {
+        let message = phase.message
+        unlockProgressLabel?.stringValue = message
+        unlockProgressLabel?.textColor = color
+        unlockProgressLabel?.isHidden = false
+        if lastUnlockProgressMessage != message {
+            appendLog("UNLOCK PROGRESSION: \(message)\n")
+            lastUnlockProgressMessage = message
+        }
+    }
+
+    private func clearUnlockTransition() {
+        unlockRetryWorkItem?.cancel()
+        unlockRetryWorkItem = nil
+        unlockRetryAttempt = 0
+        trackedUnlocker = nil
+        readyUnlockVolumeIdentifier = nil
+        lastUnlockProgressMessage = nil
+        clearUnlockTransitionUI()
+    }
+
+    private func clearUnlockTransitionUI() {
+        unlockProgressLabel?.stringValue = ""
+        unlockProgressLabel?.isHidden = true
+        showUnlockerButton?.isEnabled = false
+        showUnlockerButton?.isHidden = true
+        showUnlockerButton?.toolTip = nil
+    }
+
+    private func updateShowUnlockerButton() {
+        guard let trackedUnlocker else {
+            clearUnlockTransitionUI()
+            return
+        }
+        showUnlockerButton?.isHidden = false
+        let hasMountPoint = nonEmpty(trackedUnlocker.mountPoint) != nil
+        showUnlockerButton?.isEnabled = !isRunning && !isRefreshing && hasMountPoint
+        showUnlockerButton?.toolTip = hasMountPoint
+            ? "Reveal the mounted vendor unlocker volume in Finder without opening its application."
+            : "The vendor unlocker volume is not currently mounted."
+    }
+
     private func runPendingAutomaticRefreshIfNeeded() {
         guard automaticRefreshPending, !isRunning, !isRefreshing else {
             return
@@ -348,14 +643,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func volumeSelectionChanged() {
+        if selectedVolume() != nil {
+            selectionRequiresUserChoice = false
+        }
         updateSelectionDetails()
         setControlsForRunningState(false)
     }
 
     private func updateSelectionDetails() {
         guard let volume = selectedVolume(), let disk = snapshot.disk(containing: volume) else {
-            if let notice = snapshot.notices.first {
-                volumeDetailLabel?.stringValue = notice
+            if let trackedUnlocker {
+                volumeDetailLabel?.stringValue = "Detected \(trackedUnlocker.name), which is the vendor unlock helper rather than the data volume. No application or credential prompt is opened automatically."
                 setStatus("Unlock helper detected — waiting for the data volume", color: .systemOrange)
             } else {
                 volumeDetailLabel?.stringValue = "No user-facing external volume detected."
@@ -372,7 +670,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func selectedVolume() -> ExternalVolume? {
-        guard let index = volumePopup?.indexOfSelectedItem, snapshot.volumes.indices.contains(index) else {
+        guard let index = volumePopup?.selectedItem?.tag, snapshot.volumes.indices.contains(index) else {
             return nil
         }
         return snapshot.volumes[index]
@@ -502,6 +800,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return "Privacy redaction: disabled\n\n\(completeLog)"
         }
         return privacyRedactedReport(completeLog, userName: NSUserName())
+    }
+
+    @objc private func showUnlockerInFinder() {
+        guard let mountPoint = nonEmpty(trackedUnlocker?.mountPoint) else {
+            setStatus("The unlocker volume is not mounted", color: .systemRed)
+            appendLog("UNLOCKER FINDER ACTION FAILED: no mounted unlocker path is available.\n")
+            return
+        }
+        var isDirectory = ObjCBool(false)
+        guard FileManager.default.fileExists(atPath: mountPoint, isDirectory: &isDirectory), isDirectory.boolValue else {
+            setStatus("The unlocker volume is no longer available", color: .systemRed)
+            appendLog("UNLOCKER FINDER ACTION FAILED: \(mountPoint) is no longer a mounted directory.\n")
+            return
+        }
+        let opened = NSWorkspace.shared.open(URL(fileURLWithPath: mountPoint, isDirectory: true))
+        guard opened else {
+            setStatus("Finder could not reveal the unlocker volume", color: .systemRed)
+            appendLog("UNLOCKER FINDER ACTION FAILED: Finder rejected \(mountPoint).\n")
+            return
+        }
+        setStatus("Unlocker volume shown in Finder", color: .systemGreen)
+        appendLog("UNLOCKER FINDER ACTION: revealed \(mountPoint). No unlocker application was launched and no credentials were collected.\n")
     }
 
     @objc private func revealVolumes() {
@@ -758,7 +1078,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         stopButton?.isEnabled = running
         refreshButton?.isEnabled = !running && !isRefreshing
         ejectButton?.isEnabled = !running && hasSelection && !isRefreshing
-        volumePopup?.isEnabled = !running && !isRefreshing
+        let hasUnlockerMountPoint = nonEmpty(trackedUnlocker?.mountPoint) != nil
+        showUnlockerButton?.isEnabled = !running && !isRefreshing && hasUnlockerMountPoint
+        volumePopup?.isEnabled = !running && !isRefreshing && !snapshot.volumes.isEmpty
         readOnlyCheckbox?.isEnabled = !running
         copyButton?.isEnabled = !running && !completeLog.isEmpty
         saveButton?.isEnabled = !running && !completeLog.isEmpty

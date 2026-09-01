@@ -21,15 +21,47 @@ struct ExternalVolume: Hashable, Sendable {
 struct ExternalDisk: Hashable, Sendable {
     let identifier: String
     let name: String
+    let deviceTreePath: String?
     let busProtocol: String
     let smartStatus: String
     let size: Int64
     let volumes: [ExternalVolume]
 }
 
+struct VirtualUnlocker: Hashable, Sendable {
+    let wholeDiskIdentifier: String
+    let volumeIdentifier: String?
+    let name: String
+    let mountPoint: String?
+    let deviceTreePath: String?
+}
+
+enum UnlockTransitionPhase: Equatable, Sendable {
+    case detected
+    case waiting
+    case retry(attempt: Int, limit: Int)
+    case ready(volumeName: String)
+    case exhausted(limit: Int)
+
+    var message: String {
+        switch self {
+        case .detected:
+            return "Unlocker detected"
+        case .waiting:
+            return "Unlocker detected → Waiting for data disk"
+        case let .retry(attempt, limit):
+            return "Unlocker detected → Waiting for data disk (retry \(attempt) of \(limit))"
+        case let .ready(volumeName):
+            return "Unlocker detected → Waiting for data disk → \(volumeName) ready"
+        case let .exhausted(limit):
+            return "Unlocker detected → Waiting for data disk → Not detected after \(limit) retries"
+        }
+    }
+}
+
 struct DiskSnapshot: Sendable {
     let disks: [ExternalDisk]
-    let notices: [String]
+    let unlockers: [VirtualUnlocker]
 
     var volumes: [ExternalVolume] {
         disks.flatMap(\.volumes).sorted {
@@ -42,6 +74,46 @@ struct DiskSnapshot: Sendable {
 
     func disk(containing volume: ExternalVolume) -> ExternalDisk? {
         disks.first { $0.identifier == volume.wholeDiskIdentifier }
+    }
+
+    func dataVolume(matching unlocker: VirtualUnlocker) -> ExternalVolume? {
+        guard let deviceTreePath = nonEmpty(unlocker.deviceTreePath) else {
+            return nil
+        }
+        return disks
+            .first { $0.deviceTreePath == deviceTreePath && !$0.volumes.isEmpty }?
+            .volumes
+            .first
+    }
+
+    func removingDevice(identifier: String) -> DiskSnapshot {
+        let remainingDisks = disks.compactMap { disk -> ExternalDisk? in
+            if deviceIdentifier(disk.identifier, isSameAsOrDescendantOf: identifier) {
+                return nil
+            }
+            let remainingVolumes = disk.volumes.filter { volume in
+                !deviceIdentifier(volume.identifier, isSameAsOrDescendantOf: identifier)
+            }
+            return ExternalDisk(
+                identifier: disk.identifier,
+                name: disk.name,
+                deviceTreePath: disk.deviceTreePath,
+                busProtocol: disk.busProtocol,
+                smartStatus: disk.smartStatus,
+                size: disk.size,
+                volumes: remainingVolumes
+            )
+        }
+        let remainingUnlockers = unlockers.filter { unlocker in
+            if deviceIdentifier(unlocker.wholeDiskIdentifier, isSameAsOrDescendantOf: identifier) {
+                return false
+            }
+            guard let volumeIdentifier = unlocker.volumeIdentifier else {
+                return true
+            }
+            return !deviceIdentifier(volumeIdentifier, isSameAsOrDescendantOf: identifier)
+        }
+        return DiskSnapshot(disks: remainingDisks, unlockers: remainingUnlockers)
     }
 }
 
@@ -99,10 +171,19 @@ struct DiskListEntry: Decodable {
 struct DiskListPartition: Decodable {
     let identifier: String
     let size: Int64
+    let partitions: [DiskListPartition]
 
     enum CodingKeys: String, CodingKey {
         case identifier = "DeviceIdentifier"
         case size = "Size"
+        case partitions = "Partitions"
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        identifier = try container.decode(String.self, forKey: .identifier)
+        size = try container.decode(Int64.self, forKey: .size)
+        partitions = try container.decodeIfPresent([DiskListPartition].self, forKey: .partitions) ?? []
     }
 }
 
@@ -115,6 +196,7 @@ struct DiskInfoPropertyList: Decodable {
     let filesystemType: String?
     let filesystemName: String?
     let mountPoint: String?
+    let deviceTreePath: String?
     let busProtocol: String?
     let smartStatus: String?
     let size: Int64?
@@ -135,6 +217,7 @@ struct DiskInfoPropertyList: Decodable {
         case filesystemType = "FilesystemType"
         case filesystemName = "FilesystemName"
         case mountPoint = "MountPoint"
+        case deviceTreePath = "DeviceTreePath"
         case busProtocol = "BusProtocol"
         case smartStatus = "SMARTStatus"
         case size = "Size"
@@ -238,6 +321,16 @@ func isVirtualUnlockerDisk(_ info: DiskInfoPropertyList) -> Bool {
         .compactMap { $0?.lowercased() }
         .joined(separator: " ")
     return content == "cd_partition_scheme" && names.contains("virtual cd")
+}
+
+func flattenedPartitions(_ partitions: [DiskListPartition]) -> [DiskListPartition] {
+    partitions.flatMap { partition in
+        [partition] + flattenedPartitions(partition.partitions)
+    }
+}
+
+func deviceIdentifier(_ candidate: String, isSameAsOrDescendantOf ancestor: String) -> Bool {
+    candidate == ancestor || candidate.hasPrefix("\(ancestor)s")
 }
 
 func formattedByteCount(_ byteCount: Int64) -> String {
@@ -365,6 +458,75 @@ func runSelfTests() -> Bool {
             command: "self-test"
         ),
         isVirtualUnlockerDisk(unlockerInfo)
+    else {
+        return false
+    }
+
+    let nestedDiskListXML = """
+    <?xml version="1.0" encoding="UTF-8"?>
+    <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+    <plist version="1.0"><dict><key>AllDisksAndPartitions</key><array><dict>
+    <key>DeviceIdentifier</key><string>disk3</string><key>Size</key><integer>36000000</integer>
+    <key>Partitions</key><array><dict>
+    <key>DeviceIdentifier</key><string>disk3s0</string><key>Size</key><integer>35000000</integer>
+    <key>Partitions</key><array><dict>
+    <key>DeviceIdentifier</key><string>disk3s0s2</string><key>Size</key><integer>2500000</integer>
+    </dict></array></dict></array>
+    </dict></array></dict></plist>
+    """
+    guard
+        let nestedDiskList = try? decodePropertyList(
+            DiskListPropertyList.self,
+            output: nestedDiskListXML,
+            command: "self-test"
+        ),
+        flattenedPartitions(nestedDiskList.disks[0].partitions).map(\.identifier) == ["disk3s0", "disk3s0s2"]
+    else {
+        return false
+    }
+
+    let testVolume = ExternalVolume(
+        identifier: "disk4s1",
+        wholeDiskIdentifier: "disk4",
+        name: "Extreme SSD",
+        filesystem: "ExFAT",
+        mountPoint: "/Volumes/Extreme SSD",
+        isEncrypted: false,
+        isLocked: false,
+        isWritable: true,
+        role: nil,
+        size: 2_000_000_000_000
+    )
+    let testUnlocker = VirtualUnlocker(
+        wholeDiskIdentifier: "disk3",
+        volumeIdentifier: "disk3s0s2",
+        name: "SanDisk Unlocker",
+        mountPoint: "/Volumes/SanDisk Unlocker",
+        deviceTreePath: "IODeviceTree:/usb/storage"
+    )
+    let unlockSnapshot = DiskSnapshot(
+        disks: [
+            ExternalDisk(
+                identifier: "disk4",
+                name: "Extreme 55AE",
+                deviceTreePath: "IODeviceTree:/usb/storage",
+                busProtocol: "USB",
+                smartStatus: "Verified",
+                size: 2_000_000_000_000,
+                volumes: [testVolume]
+            )
+        ],
+        unlockers: [testUnlocker]
+    )
+    guard
+        unlockSnapshot.dataVolume(matching: testUnlocker) == testVolume,
+        unlockSnapshot.removingDevice(identifier: "disk4s1").volumes.isEmpty,
+        unlockSnapshot.removingDevice(identifier: "disk4").disks.isEmpty,
+        unlockSnapshot.removingDevice(identifier: "disk3s0").unlockers.isEmpty,
+        deviceIdentifier("disk4s1", isSameAsOrDescendantOf: "disk4"),
+        !deviceIdentifier("disk40s1", isSameAsOrDescendantOf: "disk4"),
+        UnlockTransitionPhase.retry(attempt: 2, limit: 5).message.contains("retry 2 of 5"),
+        UnlockTransitionPhase.ready(volumeName: "Extreme SSD").message.hasSuffix("Extreme SSD ready")
     else {
         return false
     }

@@ -96,10 +96,12 @@ Volume Mount Troubleshooter currently provides:
 - read-only mounting enabled by default;
 - a confirmation boundary before unmounting a writable volume for read-only remounting;
 - APFS/FileVault encryption and locked-state detection without password handling;
+- bounded unlock-transition retries with visible progress and hardware-path matching;
+- Finder-only reveal for mounted vendor unlocker volumes without launching their applications;
 - SMART status reporting without treating `Not Supported` as a healthy result;
 - USB negotiated-link-rate extraction from IOKit when available;
 - recent `diskarbitrationd` error and fault collection;
-- native Disk Arbitration notification handling for newly attached devices;
+- native Disk Arbitration notification handling for attached and disconnected devices, including immediate stale-selector removal;
 - exact post-mount verification of mount point and writable state;
 - guided explanations for common mount and eject failures;
 - confirmed whole-disk Safe Eject;
@@ -146,7 +148,7 @@ flowchart TB
     UI["Native AppKit GUI and live console"]
 
     subgraph Discovery["Typed external-storage discovery"]
-        DA["Disk Arbitration appeared callback"]
+        DA["Disk Arbitration appeared and disappeared callbacks"]
         List["diskutil external physical plist"]
         APFS["APFS container and volume plist"]
         Selector["User-facing volume selector"]
@@ -281,9 +283,11 @@ Disk identifiers are rediscovered on every refresh. The app does not assume iden
 
 ### Automatic detection
 
-The app registers a native Disk Arbitration appeared callback. When macOS publishes a disk object, the callback schedules a fresh typed inventory after a short debounce interval.
+The app registers native Disk Arbitration appeared and disappeared callbacks. When macOS publishes a disk object, the appeared callback schedules a fresh typed inventory after a short debounce interval. When a disk disappears, the app immediately removes that device and its volumes from the in-memory snapshot and selector, clears a stale selection, and disables Mount and Safe Eject until the user deliberately selects another available volume. A follow-up inventory then reconciles the complete device list.
 
-If a second disk event arrives while an inventory is already running, the app retains it and performs one follow-up refresh. Storage inventory commands time out after 15 seconds so a vendor unlock transition cannot leave the selector waiting indefinitely.
+If a disk disappears while an inventory is already running, the app cancels and invalidates that inventory so its older result cannot restore the removed selector entry. It then performs one follow-up refresh. Storage inventory commands time out after 15 seconds so a vendor unlock transition cannot leave the selector waiting indefinitely.
+
+When a virtual unlocker is present without its matching data disk, the app retries discovery five times at two-second intervals. The visible progression advances from **Unlocker detected** through **Waiting for data disk** to the discovered volume name, such as **Extreme SSD ready**. Association uses the shared macOS device-tree path rather than vendor names or transient `diskN` identifiers.
 
 Automatic detection refreshes the selector. It never automatically mounts, unmounts, unlocks, repairs, or ejects a device.
 
@@ -331,7 +335,7 @@ The scanner reads APFS and `diskutil` encryption metadata, including:
 
 If the selected volume is encrypted and locked, the app stops before mounting and directs the user to Finder or Disk Utility. It does not invoke `diskutil apfs unlockVolume`, display a custom password field, read standard input, inspect the keychain, or store credentials.
 
-Some hardware-encrypted external drives first expose a small read-only virtual CD containing a vendor unlocker. The app excludes that helper media from the volume selector, explains that it is not the data volume, and waits for Disk Arbitration to publish the full-size unlocked disk. Once the real filesystem appears, the existing normal or read-only selected-volume mount workflow applies.
+Some hardware-encrypted external drives first expose a small read-only virtual CD containing a vendor unlocker. The app excludes that helper media from the volume selector, explains that it is not the data volume, and waits for Disk Arbitration to publish the full-size unlocked disk. **Show Unlocker in Finder** reveals only the mounted helper directory; it does not open the vendor application, request credentials, or inspect their contents. Once the real filesystem appears, the existing normal or read-only selected-volume mount workflow applies.
 
 An encrypted and unlocked volume may be mounted normally or read-only like any other selected volume.
 
@@ -516,6 +520,11 @@ The build script automatically runs:
 The self-test covers:
 
 - strict property-list decoding;
+- nested virtual-CD partition discovery;
+- unlocker-to-data-disk hardware-path association;
+- unlock-transition progression messages and bounded command timeouts;
+- disconnected whole-disk and child-volume snapshot removal;
+- disk identifier descendant matching without prefix collisions;
 - USB link-speed extraction; and
 - privacy redaction of serial numbers and UUIDs.
 
@@ -573,7 +582,7 @@ Generated applications under `build/` are intentionally not tracked by Git.
 - The app does not identify or install third-party filesystem drivers.
 - The app does not repair filesystems or evaluate whether repair is safe.
 - Unified Log results depend on retention, privacy redaction, and the selected 15-minute window.
-- Automatic detection reacts to Disk Arbitration appeared events but does not auto-mount.
+- Automatic detection reacts to Disk Arbitration appeared and disappeared events but does not auto-mount.
 - Read-only guarantees begin only after the app verifies the requested read-only mount state.
 - The repository does not currently include a declared software license.
 
@@ -601,7 +610,7 @@ Unlock it through Finder or Disk Utility, then press **Refresh**. Do not send a 
 
 ### A SanDisk or Western Digital unlocker volume appears
 
-The small read-only unlocker is a virtual CD, not the data filesystem. Complete the vendor unlock, wait for the automatic follow-up refresh, and select the full-size volume when it appears. If the selector is still waiting after the drive settles, press **Refresh**; the app will never submit or collect the vendor password.
+The small read-only unlocker is a virtual CD, not the data filesystem. Use **Show Unlocker in Finder** if you need to locate it, then deliberately open the vendor utility yourself. Complete the vendor unlock and watch the five-attempt progress indicator until the full-size volume appears. Pressing **Refresh** restarts the retry budget; the app never launches the utility or submits, reads, or stores its password.
 
 ### Read-only remount fails with `Resource busy`
 

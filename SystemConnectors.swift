@@ -150,13 +150,16 @@ final class DiskScanner: @unchecked Sendable {
         )
 
         var disks: [ExternalDisk] = []
-        var notices: [String] = []
+        var unlockers: [VirtualUnlocker] = []
         for entry in diskList.disks {
             let wholeInfo = try diskInfo(identifier: entry.identifier, onCommand: onCommand)
             if isVirtualUnlockerDisk(wholeInfo) {
-                let name = nonEmpty(wholeInfo.registryName) ?? nonEmpty(wholeInfo.mediaName) ?? entry.identifier
-                notices.append(
-                    "Detected \(name), which is the vendor unlock helper rather than the data volume. Complete the unlock, then wait for automatic refresh or press Refresh."
+                unlockers.append(
+                    try virtualUnlocker(
+                        entry: entry,
+                        wholeInfo: wholeInfo,
+                        onCommand: onCommand
+                    )
                 )
                 continue
             }
@@ -202,6 +205,7 @@ final class DiskScanner: @unchecked Sendable {
                 ExternalDisk(
                     identifier: entry.identifier,
                     name: diskName,
+                    deviceTreePath: nonEmpty(wholeInfo.deviceTreePath),
                     busProtocol: nonEmpty(wholeInfo.busProtocol) ?? "Unknown",
                     smartStatus: nonEmpty(wholeInfo.smartStatus) ?? "Unavailable",
                     size: wholeInfo.totalSize ?? wholeInfo.size ?? entry.size,
@@ -211,7 +215,29 @@ final class DiskScanner: @unchecked Sendable {
         }
         return DiskSnapshot(
             disks: disks.sorted { $0.identifier < $1.identifier },
-            notices: notices
+            unlockers: unlockers.sorted { $0.wholeDiskIdentifier < $1.wholeDiskIdentifier }
+        )
+    }
+
+    private func virtualUnlocker(
+        entry: DiskListEntry,
+        wholeInfo: DiskInfoPropertyList,
+        onCommand: @escaping (String) -> Void
+    ) throws -> VirtualUnlocker {
+        let partitionInfos = try flattenedPartitions(entry.partitions).map { partition in
+            try diskInfo(identifier: partition.identifier, onCommand: onCommand)
+        }
+        let mountedInfo = partitionInfos.first { nonEmpty($0.mountPoint) != nil }
+        let name = nonEmpty(mountedInfo?.volumeName)
+            ?? nonEmpty(wholeInfo.registryName)
+            ?? nonEmpty(wholeInfo.mediaName)
+            ?? entry.identifier
+        return VirtualUnlocker(
+            wholeDiskIdentifier: entry.identifier,
+            volumeIdentifier: mountedInfo?.identifier,
+            name: name,
+            mountPoint: nonEmpty(mountedInfo?.mountPoint),
+            deviceTreePath: nonEmpty(wholeInfo.deviceTreePath)
         )
     }
 
@@ -312,19 +338,32 @@ final class DiskScanner: @unchecked Sendable {
     }
 }
 
+enum DiskArbitrationEvent: Equatable, Sendable {
+    case appeared(identifier: String)
+    case disappeared(identifier: String)
+}
+
 private let diskAppearedCallback: DADiskAppearedCallback = { disk, context in
     guard let context, let bsdName = DADiskGetBSDName(disk) else {
         return
     }
-    let monitor = Unmanaged<DiskArrivalMonitor>.fromOpaque(context).takeUnretainedValue()
-    monitor.diskAppeared(identifier: String(cString: bsdName))
+    let monitor = Unmanaged<DiskEventMonitor>.fromOpaque(context).takeUnretainedValue()
+    monitor.handle(.appeared(identifier: String(cString: bsdName)))
 }
 
-final class DiskArrivalMonitor {
-    private let handler: @Sendable (String) -> Void
+private let diskDisappearedCallback: DADiskDisappearedCallback = { disk, context in
+    guard let context, let bsdName = DADiskGetBSDName(disk) else {
+        return
+    }
+    let monitor = Unmanaged<DiskEventMonitor>.fromOpaque(context).takeUnretainedValue()
+    monitor.handle(.disappeared(identifier: String(cString: bsdName)))
+}
+
+final class DiskEventMonitor {
+    private let handler: @Sendable (DiskArbitrationEvent) -> Void
     private var session: DASession?
 
-    init(handler: @escaping @Sendable (String) -> Void) {
+    init(handler: @escaping @Sendable (DiskArbitrationEvent) -> Void) {
         self.handler = handler
     }
 
@@ -338,11 +377,12 @@ final class DiskArrivalMonitor {
         self.session = session
         let context = Unmanaged.passUnretained(self).toOpaque()
         DARegisterDiskAppearedCallback(session, nil, diskAppearedCallback, context)
+        DARegisterDiskDisappearedCallback(session, nil, diskDisappearedCallback, context)
         DASessionScheduleWithRunLoop(session, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue)
     }
 
-    func diskAppeared(identifier: String) {
-        handler(identifier)
+    func handle(_ event: DiskArbitrationEvent) {
+        handler(event)
     }
 
     deinit {
