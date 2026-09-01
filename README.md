@@ -9,7 +9,7 @@
 ![Platform](https://img.shields.io/badge/platform-macOS-000000?logo=apple&logoColor=white)
 ![Architecture](https://img.shields.io/badge/architecture-universal%20arm64%20%2B%20x86__64-8250df)
 ![Swift](https://img.shields.io/badge/Swift-5%20language%20mode-F05138?logo=swift&logoColor=white)
-![Version](https://img.shields.io/badge/version-0.2-0969da)
+![Version](https://img.shields.io/badge/version-0.3.0-0969da)
 ![Controls](https://img.shields.io/badge/controls-explicit%20actions-1a7f37)
 ![Dependencies](https://img.shields.io/badge/required%20third--party%20dependencies-none-1a7f37)
 ![Network](https://img.shields.io/badge/network%20access-none-1a7f37)
@@ -259,7 +259,7 @@ The generated application is:
 build/Volume Mount Troubleshooter.app
 ```
 
-The previously published v0.2 `macos-arm64` release asset remains Apple-Silicon-only. A release is universal only when its filename ends in `macOS-universal.zip` and its checksum matches the accompanying `SHA256SUMS.txt` file.
+The historical v0.2 `macos-arm64` release asset remains Apple-Silicon-only. The v0.3.0 release is universal when its filename ends in `macOS-universal.zip` and its checksum matches the accompanying `SHA256SUMS.txt` file.
 
 ---
 
@@ -612,7 +612,7 @@ The [`macOS CI` workflow](.github/workflows/macos-ci.yml) runs on every branch p
 5. downloads that exact package on `macos-15-intel` and repeats checksum, architecture, signature, and native Intel self-test validation; and
 6. attaches both verified files to an existing GitHub Release when that release is published.
 
-A `v*` tag must exactly match `CFBundleShortVersionString`, such as tag `v0.3` for app version `0.3`, or the release workflow fails before packaging. GitHub documents `macos-15` as arm64 and `macos-15-intel` as Intel runner labels, while artifact uploads expose a SHA-256 digest in addition to the project's downloadable checksum file. [GitHub-hosted runner reference](https://docs.github.com/en/actions/how-tos/write-workflows/choose-where-workflows-run/choose-the-runner-for-a-job), [workflow artifact validation](https://docs.github.com/en/actions/tutorials/store-and-share-data)
+A `v*` tag must exactly match `CFBundleShortVersionString`, such as tag `v0.3.0` for app version `0.3.0`, or the release workflow fails before packaging. GitHub documents `macos-15` as arm64 and `macos-15-intel` as Intel runner labels, while artifact uploads expose a SHA-256 digest in addition to the project's downloadable checksum file. [GitHub-hosted runner reference](https://docs.github.com/en/actions/how-tos/write-workflows/choose-where-workflows-run/choose-the-runner-for-a-job), [workflow artifact validation](https://docs.github.com/en/actions/tutorials/store-and-share-data)
 
 ### Live read-only scanner integration test
 
