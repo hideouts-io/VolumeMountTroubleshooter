@@ -125,11 +125,60 @@ final class CommandRunner: @unchecked Sendable {
     }
 }
 
+enum ScannedExternalDisk: Sendable {
+    case disk(ExternalDisk)
+    case unlocker(VirtualUnlocker)
+}
+
+func externalDiskSnapshot(
+    entries: [DiskListEntry],
+    scanEntry: (DiskListEntry) throws -> ScannedExternalDisk
+) throws -> DiskSnapshot {
+    var disks: [ExternalDisk] = []
+    var unlockers: [VirtualUnlocker] = []
+    var scanFailures: [DiskScanFailure] = []
+    for entry in entries {
+        do {
+            switch try scanEntry(entry) {
+            case let .disk(disk):
+                disks.append(disk)
+            case let .unlocker(unlocker):
+                unlockers.append(unlocker)
+            }
+        } catch TroubleshooterError.cancelled {
+            throw TroubleshooterError.cancelled
+        } catch let error as TroubleshooterError {
+            scanFailures.append(
+                DiskScanFailure(
+                    diskIdentifier: entry.identifier,
+                    errorDescription: error.localizedDescription
+                )
+            )
+        }
+    }
+    return DiskSnapshot(
+        disks: disks.sorted { $0.identifier < $1.identifier },
+        unlockers: unlockers.sorted { $0.wholeDiskIdentifier < $1.wholeDiskIdentifier },
+        scanFailures: scanFailures.sorted { $0.diskIdentifier < $1.diskIdentifier }
+    )
+}
+
 final class DiskScanner: @unchecked Sendable {
     private let runner: CommandRunner
+    private let smartctlExecutable: String?
 
     init(runner: CommandRunner) {
         self.runner = runner
+        self.smartctlExecutable = firstExecutablePath(
+            candidates: [
+                Bundle.main.bundleURL.appendingPathComponent("Contents/Resources/smartctl").path,
+                "/opt/homebrew/sbin/smartctl",
+                "/usr/local/sbin/smartctl",
+                "/usr/local/bin/smartctl",
+                "/opt/local/sbin/smartctl"
+            ],
+            fileManager: FileManager.default
+        )
     }
 
     func scan(onCommand: @escaping (String) -> Void) throws -> DiskSnapshot {
@@ -149,74 +198,115 @@ final class DiskScanner: @unchecked Sendable {
             command: listCommand
         )
 
-        var disks: [ExternalDisk] = []
-        var unlockers: [VirtualUnlocker] = []
-        for entry in diskList.disks {
-            let wholeInfo = try diskInfo(identifier: entry.identifier, onCommand: onCommand)
-            if isVirtualUnlockerDisk(wholeInfo) {
-                unlockers.append(
-                    try virtualUnlocker(
-                        entry: entry,
-                        wholeInfo: wholeInfo,
-                        onCommand: onCommand
-                    )
-                )
-                continue
-            }
-            var volumes: [ExternalVolume] = []
+        return try externalDiskSnapshot(entries: diskList.disks) { entry in
+            try self.scanExternalDisk(entry: entry, onCommand: onCommand)
+        }
+    }
 
-            if entry.partitions.isEmpty, wholeInfo.filesystemType != nil {
+    private func scanExternalDisk(
+        entry: DiskListEntry,
+        onCommand: @escaping (String) -> Void
+    ) throws -> ScannedExternalDisk {
+        let wholeInfo = try diskInfo(identifier: entry.identifier, onCommand: onCommand)
+        if isVirtualUnlockerDisk(wholeInfo) {
+            return .unlocker(
+                try virtualUnlocker(
+                    entry: entry,
+                    wholeInfo: wholeInfo,
+                    onCommand: onCommand
+                )
+            )
+        }
+        var volumes: [ExternalVolume] = []
+
+        if entry.partitions.isEmpty, wholeInfo.filesystemType != nil {
+            volumes.append(
+                externalVolume(
+                    info: wholeInfo,
+                    wholeDiskIdentifier: entry.identifier,
+                    fallbackName: entry.identifier,
+                    fallbackSize: entry.size,
+                    apfsRecord: nil
+                )
+            )
+        }
+
+        for partition in entry.partitions {
+            let partitionInfo = try diskInfo(identifier: partition.identifier, onCommand: onCommand)
+            if let containerReference = nonEmpty(partitionInfo.apfsContainerReference) {
+                let apfsVolumes = try volumesInAPFSContainer(
+                    containerReference: containerReference,
+                    wholeDiskIdentifier: entry.identifier,
+                    onCommand: onCommand
+                )
+                volumes.append(contentsOf: apfsVolumes)
+            } else if partitionInfo.filesystemType != nil {
                 volumes.append(
                     externalVolume(
-                        info: wholeInfo,
+                        info: partitionInfo,
                         wholeDiskIdentifier: entry.identifier,
-                        fallbackName: entry.identifier,
-                        fallbackSize: entry.size,
+                        fallbackName: partition.identifier,
+                        fallbackSize: partition.size,
                         apfsRecord: nil
                     )
                 )
             }
+        }
 
-            for partition in entry.partitions {
-                let partitionInfo = try diskInfo(identifier: partition.identifier, onCommand: onCommand)
-                if let containerReference = nonEmpty(partitionInfo.apfsContainerReference) {
-                    let apfsVolumes = try volumesInAPFSContainer(
-                        containerReference: containerReference,
-                        wholeDiskIdentifier: entry.identifier,
-                        onCommand: onCommand
-                    )
-                    volumes.append(contentsOf: apfsVolumes)
-                } else if partitionInfo.filesystemType != nil {
-                    volumes.append(
-                        externalVolume(
-                            info: partitionInfo,
-                            wholeDiskIdentifier: entry.identifier,
-                            fallbackName: partition.identifier,
-                            fallbackSize: partition.size,
-                            apfsRecord: nil
-                        )
-                    )
-                }
-            }
+        let uniqueVolumes = Dictionary(grouping: volumes, by: \.identifier).compactMap { $0.value.first }
+        let diskName = nonEmpty(wholeInfo.mediaName) ?? nonEmpty(wholeInfo.registryName) ?? entry.identifier
+        let expandedSMART = try collectExpandedSMART(
+            identifier: entry.identifier,
+            onCommand: onCommand
+        )
+        return .disk(
+            ExternalDisk(
+                identifier: entry.identifier,
+                name: diskName,
+                deviceTreePath: nonEmpty(wholeInfo.deviceTreePath),
+                busProtocol: nonEmpty(wholeInfo.busProtocol) ?? "Unknown",
+                smartStatus: nonEmpty(wholeInfo.smartStatus) ?? "Unavailable",
+                expandedSMART: expandedSMART,
+                size: wholeInfo.totalSize ?? wholeInfo.size ?? entry.size,
+                volumes: uniqueVolumes.sorted { $0.identifier < $1.identifier }
+            )
+        )
+    }
 
-            let uniqueVolumes = Dictionary(grouping: volumes, by: \.identifier).compactMap { $0.value.first }
-            let diskName = nonEmpty(wholeInfo.mediaName) ?? nonEmpty(wholeInfo.registryName) ?? entry.identifier
-            disks.append(
-                ExternalDisk(
-                    identifier: entry.identifier,
-                    name: diskName,
-                    deviceTreePath: nonEmpty(wholeInfo.deviceTreePath),
-                    busProtocol: nonEmpty(wholeInfo.busProtocol) ?? "Unknown",
-                    smartStatus: nonEmpty(wholeInfo.smartStatus) ?? "Unavailable",
-                    size: wholeInfo.totalSize ?? wholeInfo.size ?? entry.size,
-                    volumes: uniqueVolumes.sorted { $0.identifier < $1.identifier }
-                )
+    private func collectExpandedSMART(
+        identifier: String,
+        onCommand: @escaping (String) -> Void
+    ) throws -> ExpandedSMART {
+        guard let smartctlExecutable else {
+            return .unavailable(
+                reason: "the optional smartctl collector is not installed and native macOS exposed only overall SMART status"
             )
         }
-        return DiskSnapshot(
-            disks: disks.sorted { $0.identifier < $1.identifier },
-            unlockers: unlockers.sorted { $0.wholeDiskIdentifier < $1.wholeDiskIdentifier }
-        )
+        let arguments = ["--all", "--json", "/dev/\(identifier)"]
+        let command = renderedCommand(executable: smartctlExecutable, arguments: arguments)
+        onCommand(command)
+        let result: CommandResult
+        do {
+            result = try runner.run(
+                executable: smartctlExecutable,
+                arguments: arguments,
+                timeoutSeconds: 15
+            ) { _ in }
+        } catch TroubleshooterError.cancelled {
+            throw TroubleshooterError.cancelled
+        } catch let error as TroubleshooterError {
+            return .unavailable(reason: error.localizedDescription)
+        }
+        do {
+            return try decodeExpandedSMART(
+                output: result.output,
+                command: command,
+                collector: smartctlExecutable,
+                exitStatus: result.exitStatus
+            )
+        } catch let error as TroubleshooterError {
+            return .unavailable(reason: error.localizedDescription)
+        }
     }
 
     private func virtualUnlocker(
@@ -336,6 +426,10 @@ final class DiskScanner: @unchecked Sendable {
         }
         return result
     }
+}
+
+func firstExecutablePath(candidates: [String], fileManager: FileManager) -> String? {
+    candidates.first { fileManager.isExecutableFile(atPath: $0) }
 }
 
 enum DiskArbitrationEvent: Equatable, Sendable {

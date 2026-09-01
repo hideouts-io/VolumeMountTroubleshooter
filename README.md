@@ -10,12 +10,12 @@
 ![Architecture](https://img.shields.io/badge/architecture-Apple%20Silicon-8250df)
 ![Swift](https://img.shields.io/badge/Swift-5%20language%20mode-F05138?logo=swift&logoColor=white)
 ![Version](https://img.shields.io/badge/version-0.2-0969da)
-![Default](https://img.shields.io/badge/default%20mount-read--only-1a7f37)
-![Dependencies](https://img.shields.io/badge/third--party%20dependencies-none-1a7f37)
+![Controls](https://img.shields.io/badge/controls-explicit%20actions-1a7f37)
+![Dependencies](https://img.shields.io/badge/required%20third--party%20dependencies-none-1a7f37)
 ![Network](https://img.shields.io/badge/network%20access-none-1a7f37)
-![License](https://img.shields.io/badge/license-not%20declared-lightgrey)
+![License](https://img.shields.io/badge/license-MIT-1a7f37)
 
-> **Scope:** Volume Mount Troubleshooter is a native macOS utility for identifying attached external storage, selecting one user-facing volume, inspecting the hardware and filesystem path, and requesting a normal or read-only mount. It does not erase, partition, format, repair, force-eject, unlock encrypted storage, collect credentials, or prove that a disk is healthy. Every operational command and exit status is visible in the built-in console.
+> **Scope:** Volume Mount Troubleshooter is a native macOS utility for identifying attached external storage, selecting one user-facing volume, and explicitly inspecting, mounting, unmounting, or safely ejecting it. It does not erase, partition, format, repair, force-eject, unlock encrypted storage, collect credentials, or prove that a disk is healthy. Every operational command and exit status is visible in the built-in console.
 
 ---
 
@@ -53,20 +53,20 @@
 
 Volume Mount Troubleshooter turns the normal macOS storage-diagnostic workflow into a small native GUI. The application discovers external physical disks through `diskutil`, resolves APFS containers into user-facing volumes, and presents a selector rather than issuing a mount request against every connected disk.
 
-When **Start** is pressed, the app displays each command as it runs and preserves:
+When an explicit action is pressed, the app displays each command as it runs and preserves:
 
 - the exact executable and arguments;
 - combined command output;
 - the process exit status;
 - the selected physical disk and volume identifiers;
-- the requested mount mode;
+- the selected action;
 - encryption and locked state;
-- SMART availability and USB link information;
+- overall SMART status, optional detailed health counters, and USB link information;
 - mount-point and writable-state verification;
 - recent Disk Arbitration errors and faults; and
 - a bounded explanation tied to the observed error text.
 
-The app uses only Apple frameworks and fixed Apple command-line tools. It has no package-manager dependencies and makes no network requests.
+The app uses only Apple frameworks and fixed Apple command-line tools for its required functionality. It has no required package-manager dependencies and makes no network requests. If an existing `smartctl` installation is found at a known fixed path, the app can read additional health counters without installing or updating anything.
 
 ---
 
@@ -74,9 +74,9 @@ The app uses only Apple frameworks and fixed Apple command-line tools. It has no
 
 ### Main window
 
-![Volume Mount Troubleshooter main window with a selected APFS volume and read-only mode enabled](docs/images/volume-mount-troubleshooter-main.png)
+![Volume Mount Troubleshooter main window with a selected APFS volume](docs/images/volume-mount-troubleshooter-main.png)
 
-The main window keeps selection, mount mode, privacy controls, current status, actions, and the live command console in one view.
+The main window keeps selection, explicit actions, privacy controls, current status, and the live command console in one view.
 
 ### Volume selector
 
@@ -92,13 +92,14 @@ Volume Mount Troubleshooter currently provides:
 
 - a selector containing one entry per user-facing external volume;
 - typed parsing of `diskutil` and APFS property-list output;
+- per-disk failure isolation that preserves exact errors while retaining usable volumes from other disks;
 - exclusion of APFS Preboot, Recovery, VM, Update, xART, and Hardware helper volumes;
-- read-only mounting enabled by default;
+- explicit Inspect, Mount Read-Only, Mount Normally, Unmount Volume, and Safe Eject Disk controls;
 - a confirmation boundary before unmounting a writable volume for read-only remounting;
 - APFS/FileVault encryption and locked-state detection without password handling;
 - bounded unlock-transition retries with visible progress and hardware-path matching;
 - Finder-only reveal for mounted vendor unlocker volumes without launching their applications;
-- SMART status reporting without treating `Not Supported` as a healthy result;
+- SMART status plus optional temperature, media-error, unsafe-shutdown, power-on-hour, and percentage-used reporting;
 - USB negotiated-link-rate extraction from IOKit when available;
 - recent `diskarbitrationd` error and fault collection;
 - native Disk Arbitration notification handling for attached and disconnected devices, including immediate stale-selector removal;
@@ -129,11 +130,12 @@ The app separates inspection, mounting, and whole-device ejection.
 | Action | Target | State change | Confirmation |
 |---|---|---:|---:|
 | Refresh or automatic detection | External disk metadata | None | No |
-| Start diagnostics | Selected disk and volume | None until mount stage | No |
-| Normal mount | Selected volume only | Mounts the volume | Start button |
-| Read-only mount of an unmounted volume | Selected volume only | Mounts read-only | Start button |
+| Inspect | Selected disk and volume | None | No |
+| Mount Normally | Selected volume only | Mounts the volume | Explicit button |
+| Mount Read-Only on an unmounted volume | Selected volume only | Mounts read-only | Explicit button |
 | Read-only remount of a writable mounted volume | Selected volume only | Unmounts, then mounts read-only | Additional warning dialog |
-| Safe Eject | Selected volume's whole physical disk | Ejects the disk and sibling volumes | Additional warning dialog |
+| Unmount Volume | Selected volume only | Unmounts only that volume | Explicit button |
+| Safe Eject Disk | Selected volume's whole physical disk | Ejects the disk and sibling volumes | Additional warning dialog |
 | Save Report | User-selected destination | Writes one text report | Standard save dialog |
 
 The application never constructs or runs repair, erase, partition, format, force-eject, unlock, or `sudo` commands. A failed mount remains a failure with its original output visible; the app does not silently switch to a different mode.
@@ -161,11 +163,14 @@ flowchart TB
         Logs["Recent diskarbitrationd errors"]
     end
 
-    subgraph Action["Explicit selected-volume action"]
-        Mode{"Requested mode"}
+    subgraph Action["Explicit selected-volume actions"]
+        Choice{"Pressed button"}
+        Inspect["Inspect without mounting"]
         Normal["diskutil mount"]
         Confirm["Confirm writable-volume unmount"]
         ReadOnly["diskutil mount readOnly"]
+        Unmount["diskutil unmount selected volume"]
+        Eject["diskutil eject whole disk"]
         Verify["Verify mount point and writable state"]
     end
 
@@ -184,13 +189,19 @@ flowchart TB
     UI --> SP
     UI --> Info
     UI --> IOKit
-    UI --> Mode
-    Mode -->|"normal"| Normal
-    Mode -->|"read-only, unmounted"| ReadOnly
-    Mode -->|"read-only, currently writable"| Confirm
+    UI --> Choice
+    Choice --> Inspect
+    Choice --> Normal
+    Choice --> ReadOnly
+    Choice -->|"writable volume"| Confirm
+    Choice --> Unmount
+    Choice --> Eject
     Confirm --> ReadOnly
     Normal --> Verify
     ReadOnly --> Verify
+    Inspect --> Logs
+    Unmount --> Logs
+    Eject --> Logs
     Verify --> Logs
     SP --> Console
     Info --> Console
@@ -214,7 +225,7 @@ flowchart TB
 - a standard signed-in user account; and
 - an external storage device visible to macOS.
 
-No Homebrew packages, third-party frameworks, network services, kernel extensions, launch agents, launch daemons, or administrator privileges are required.
+No Homebrew packages, third-party frameworks, network services, kernel extensions, launch agents, launch daemons, or administrator privileges are required. The optional expanded SMART display uses an existing `smartctl` executable when available; it is not required for volume discovery, inspection, mounting, unmounting, or ejection.
 
 ---
 
@@ -253,13 +264,12 @@ build/Volume Mount Troubleshooter.app
 2. Wait for the selector to refresh, or press **Refresh**.
 3. Choose one user-facing volume.
 4. Review its current mount, encryption, size, transport, SMART, and APFS-role summary.
-5. Leave **Mount read-only** enabled for read-only access, or disable it for a normal mount request.
-6. Press **Start**.
-7. Review the exact commands, output, exit statuses, verification result, and any guided explanation.
-8. Use **Show Volumes** to open `/Volumes` in Finder.
-9. Use **Copy Report** or **Save Report…** to preserve the result.
+5. Press exactly one action: **Inspect**, **Mount Read-Only**, **Mount Normally**, **Unmount Volume**, or **Safe Eject Disk**.
+6. Review the exact commands, output, exit statuses, verification result, and any guided explanation.
+7. Use **Show Volumes** to open `/Volumes` in Finder.
+8. Use **Copy Report** or **Save Report…** to preserve the result.
 
-The **Stop** button terminates the active command and cancels the remaining workflow. It does not continue to a mount after cancellation.
+**Inspect** is the Return-key default and never mounts or unmounts the volume. The **Stop** button terminates the active command and cancels the remaining workflow. It does not continue to a state-changing command after cancellation.
 
 ---
 
@@ -277,13 +287,15 @@ For each external physical disk, the app reads typed disk and partition informat
 /usr/sbin/diskutil apfs list -plist /dev/diskN
 ```
 
+Each physical disk is scanned within its own failure boundary. If `diskutil info`, partition decoding, or APFS discovery fails for one disk, the console records that disk identifier and the exact command error, exit status, and output. The selector still displays usable volumes discovered on other physical disks. Cancellation still stops the complete inventory, and failure of the initial external-disk list remains fatal because no reliable per-disk inventory exists in that case.
+
 Only user-facing filesystems are selectable. APFS infrastructure roles such as Preboot, Recovery, VM, Update, xART, and Hardware are intentionally excluded. Microsoft Reserved partitions and partitions without a recognized filesystem are also excluded.
 
 Disk identifiers are rediscovered on every refresh. The app does not assume identifiers such as `disk4s3` remain stable after reconnecting or restarting.
 
 ### Automatic detection
 
-The app registers native Disk Arbitration appeared and disappeared callbacks. When macOS publishes a disk object, the appeared callback schedules a fresh typed inventory after a short debounce interval. When a disk disappears, the app immediately removes that device and its volumes from the in-memory snapshot and selector, clears a stale selection, and disables Mount and Safe Eject until the user deliberately selects another available volume. A follow-up inventory then reconciles the complete device list.
+The app registers native Disk Arbitration appeared and disappeared callbacks. When macOS publishes a disk object, the appeared callback schedules a fresh typed inventory after a short debounce interval. When a disk disappears, the app immediately removes that device and its volumes from the in-memory snapshot and selector, clears a stale selection, and disables the action controls until the user deliberately selects another available volume. A follow-up inventory then reconciles the complete device list.
 
 If a disk disappears while an inventory is already running, the app cancels and invalidates that inventory so its older result cannot restore the removed selector entry. It then performs one follow-up refresh. Storage inventory commands time out after 15 seconds so a vendor unlock transition cannot leave the selector waiting indefinitely.
 
@@ -297,7 +309,7 @@ Automatic detection refreshes the selector. It never automatically mounts, unmou
 
 ### Normal mount
 
-With **Mount read-only** disabled, the selected volume receives:
+**Mount Normally** is enabled only for an unlocked, unmounted selected volume and runs:
 
 ```sh
 /usr/sbin/diskutil mount /dev/diskNsN
@@ -305,7 +317,7 @@ With **Mount read-only** disabled, the selected volume receives:
 
 ### Read-only mount
 
-For an unmounted volume, read-only mode uses:
+For an unlocked, unmounted selected volume, **Mount Read-Only** runs:
 
 ```sh
 /usr/sbin/diskutil mount readOnly /dev/diskNsN
@@ -319,6 +331,12 @@ If the selected volume is already mounted writable, macOS cannot convert that li
 ```
 
 After either mode, the app decodes fresh `diskutil info -plist` output. Success requires a non-empty mount point. Read-only success additionally requires macOS to report that the mounted volume is not writable.
+
+**Unmount Volume** is enabled only while the selected volume is mounted and targets that volume alone:
+
+```sh
+/usr/sbin/diskutil unmount /dev/diskNsN
+```
 
 Read-only is a requested and verified mount property, not a guarantee that the underlying device received no writes before the app started. Hardware, firmware, filesystem checks performed elsewhere, and earlier mounts remain outside this app's control.
 
@@ -360,6 +378,28 @@ This is attachment-layer evidence only. Some USB storage paths may be present in
 
 SMART status comes from `diskutil info` for the selected volume's external whole disk. Many USB-to-storage bridges return `Not Supported`. The app reports that limitation rather than converting it into a passing health result.
 
+For expanded health data, the app checks fixed locations for an existing `smartctl` executable and, when found, runs the read-only display command:
+
+```sh
+/opt/homebrew/sbin/smartctl --all --json /dev/diskN
+```
+
+The exact executable path may instead be `/usr/local/sbin`, `/usr/local/bin`, `/opt/local/sbin`, or a future bundled resource. The app does not search arbitrary `PATH` entries, install smartmontools, enable SMART, start tests, or change device settings. The `--all` and `--json` options request display-only health information in structured form.
+
+The raw JSON is decoded but is not copied wholesale into the console because it can contain device model and serial identifiers. The app displays only the recognized health counters, collector path, and exit status; exported reports apply the existing privacy redaction rules.
+
+When the device and bridge expose them, the app displays:
+
+- current temperature in degrees Celsius;
+- media and data-integrity error count;
+- unsafe or unexpected shutdown count;
+- power-on hours; and
+- percentage used.
+
+NVMe values come from the controller's SMART/Health Information log. The smartmontools implementation maps those counters to structured JSON fields such as `temperature.current`, `power_on_time.hours`, `percentage_used`, `unsafe_shutdowns`, and `media_errors`. ATA attribute names and raw values are vendor-specific, so the app recognizes only a conservative set of common names and labels them with a vendor-data caveat. [smartctl JSON implementation](https://www.smartmontools.org/static/doxygen/smartctl_8cpp_source.html), [NVMe JSON field mapping](https://www.smartmontools.org/static/doxygen/nvmeprint_8cpp_source.html)
+
+Missing data is shown as unavailable, never as zero. A bridge may suppress, cache, translate, or mislabel drive data; percentage used is not the same as percentage remaining and may exceed 100 on an over-endurance NVMe device. These counters are evidence reported through the current drive/bridge path, not an independent health verdict.
+
 ### USB link speed
 
 The app reads the IOUSB registry plane:
@@ -391,7 +431,7 @@ An empty result means no matching retained error or fault entry was returned for
 
 ## Safe Eject
 
-**Safe Eject…** targets the whole external physical disk associated with the selected volume:
+**Safe Eject Disk** targets the whole external physical disk associated with the selected volume:
 
 ```sh
 /usr/sbin/diskutil eject /dev/diskN
@@ -415,6 +455,7 @@ The application constructs commands only from fixed absolute executable paths, f
 | Disk or volume details | `/usr/sbin/diskutil info /dev/diskN` |
 | Typed disk or volume details | `/usr/sbin/diskutil info -plist /dev/diskNsN` |
 | Typed APFS inventory | `/usr/sbin/diskutil apfs list -plist /dev/diskN` |
+| Optional expanded SMART JSON | `<known smartctl path> --all --json /dev/diskN` |
 | USB registry evidence | `/usr/sbin/ioreg -p IOUSB -l -w0` |
 | Recent Disk Arbitration errors | `/usr/bin/log show --last 15m ...` |
 | Selected-volume unmount | `/usr/sbin/diskutil unmount /dev/diskNsN` |
@@ -437,7 +478,7 @@ The app keeps raw command evidence and guided interpretation separate.
 - typed disk, partition, APFS-container, and APFS-volume fields;
 - mount point and writable-volume state;
 - encryption, FileVault, and locked fields;
-- SMART status returned through the current storage path;
+- overall SMART status and any detailed controller/vendor counters returned through the current storage path;
 - IOKit USB link properties; and
 - recent retained Disk Arbitration error and fault entries.
 
@@ -452,7 +493,7 @@ The app keeps raw command evidence and guided interpretation separate.
 
 ### Not established
 
-- physical disk health beyond the returned SMART field;
+- physical disk health beyond the returned SMART and vendor/controller fields;
 - filesystem integrity;
 - data recoverability;
 - authorization to access encrypted contents;
@@ -479,7 +520,7 @@ The console always retains the exact error and exit status. Guided text is added
 | Exit status `0` without verified mount state | Treat the result as failed verification and review `diskutil` plus Disk Arbitration evidence. |
 | No known signature | Preserve the exact output as authoritative evidence; no speculative cause is substituted. |
 
-Command-launch failures, malformed property lists, missing required fields, cancellation, and report-write errors are all surfaced explicitly.
+Command-launch failures, malformed property lists, missing required fields, cancellation, and report-write errors are all surfaced explicitly. A per-disk discovery failure produces a partial-inventory warning rather than discarding successfully decoded volumes from other disks.
 
 ---
 
@@ -525,6 +566,9 @@ The self-test covers:
 - unlock-transition progression messages and bounded command timeouts;
 - disconnected whole-disk and child-volume snapshot removal;
 - disk identifier descendant matching without prefix collisions;
+- coexistence of usable volumes and exact per-disk scan failures;
+- explicit-action availability for unmounted, writable-mounted, locked, and absent selections;
+- standardized NVMe and conservative ATA expanded-SMART JSON parsing;
 - USB link-speed extraction; and
 - privacy redaction of serial numbers and UUIDs.
 
@@ -535,7 +579,7 @@ The self-test covers:
   --scan-test
 ```
 
-This test inventories attached external disks, parses user-facing volumes, and reports SMART, USB, mount, and encryption metadata. It does not mount, unmount, repair, erase, or eject anything.
+This test inventories attached external disks, parses user-facing volumes, and reports overall and expanded SMART, USB, mount, and encryption metadata. It does not mount, unmount, repair, erase, or eject anything.
 
 ### Manual verification
 
@@ -545,7 +589,13 @@ This test inventories attached external disks, parses user-facing volumes, and r
   "build/Volume Mount Troubleshooter.app"
 ```
 
-Read-only mount, writable-volume unmount/remount, Safe Eject, and physical hot-plug behavior require deliberate testing with a disposable external test device. Do not validate those state-changing paths against irreplaceable evidence media.
+Normal mount, read-only mount, explicit unmount, writable-volume unmount/remount, Safe Eject Disk, and physical hot-plug behavior require deliberate testing with a disposable external test device. Do not validate those state-changing paths against irreplaceable evidence media.
+
+### Hardware test matrix
+
+The [hardware test matrix](docs/HARDWARE_TEST_MATRIX.md) defines repeatable cases for unencrypted and encrypted APFS, ExFAT, NTFS, virtual unlockers, multiple disks with an isolated failure, disconnect-during-scan behavior, busy volumes, USB hubs, and verified read-only remounts. Each case records the exact build, macOS version, drive, bridge, connection path, expected result, observed result, and privacy-reviewed evidence.
+
+Matrix rows remain `NOT RUN`, `BLOCKED`, `FAIL`, or `HISTORICAL` until the behavior is deliberately exercised on disposable hardware. A parser self-test, successful build, or unobserved field is never counted as hardware validation.
 
 ---
 
@@ -557,12 +607,14 @@ VolumeMountTroubleshooter/
 ├── assets/AppIcon.png      # Canonical project logo source
 ├── assets/AppIcon.icns     # Multi-resolution macOS application icon
 ├── Diagnostics.swift       # Typed models, plist decoding, redaction, guidance
+├── docs/HARDWARE_TEST_MATRIX.md # Physical-device validation cases and records
 ├── SystemConnectors.swift  # Process, disk scanner, Disk Arbitration monitor
 ├── main.swift              # Application entry point and test modes
 ├── Info.plist              # macOS bundle metadata
 ├── build.sh                # Build, self-test, signing, and verification
 ├── script/build_and_run.sh # Build and launch entrypoint for local debugging
 ├── README.md               # Project documentation
+├── LICENSE                 # MIT software license
 └── .gitignore              # Excludes generated build output
 ```
 
@@ -576,7 +628,7 @@ Generated applications under `build/` are intentionally not tracked by Git.
 - The app is ad-hoc signed, not Developer ID signed, notarized, or distributed as a DMG or installer package.
 - Only external physical storage published by `diskutil` is considered. Internal disks, disk images, network shares, and cloud-storage providers are outside scope.
 - System Profiler may omit a connected USB device even when `diskutil` and IOKit report it.
-- SMART is frequently unavailable through USB bridges.
+- SMART is frequently unavailable through USB bridges; expanded counters also require an existing compatible `smartctl` collector.
 - USB link speed is not storage throughput.
 - Locked encrypted volumes must be unlocked outside the app.
 - The app does not identify or install third-party filesystem drivers.
@@ -584,7 +636,6 @@ Generated applications under `build/` are intentionally not tracked by Git.
 - Unified Log results depend on retention, privacy redaction, and the selected 15-minute window.
 - Automatic detection reacts to Disk Arbitration appeared and disappeared events but does not auto-mount.
 - Read-only guarantees begin only after the app verifies the requested read-only mount state.
-- The repository does not currently include a declared software license.
 
 ---
 
@@ -622,7 +673,7 @@ Treat the operation as unsuccessful. Review the fresh `diskutil info -plist` res
 
 ### SMART says `Not Supported`
 
-That result is common through USB bridges and does not establish health. Use hardware-appropriate vendor diagnostics or a direct interface when health assessment is required.
+That result is common through USB bridges and does not establish health. Expanded counters may still be unavailable because the bridge blocks SMART pass-through, `smartctl` is absent, or the current user cannot access the health interface. The app reports the reason it observed without requesting administrator credentials. Use hardware-appropriate vendor diagnostics or a direct interface when health assessment is required.
 
 ---
 
@@ -652,6 +703,6 @@ Preserve original error output before attempting repair. Never erase or format a
 
 Volume Mount Troubleshooter is an early native macOS utility. The source, parser self-test, live read-only scanner test, ad-hoc application build, and strict signature verification are available in this repository.
 
-The project currently has no third-party runtime dependencies, no telemetry, no network access, and no privileged helper.
+The project has no required third-party runtime dependencies, no telemetry, no network access, and no privileged helper. Expanded SMART collection is an optional integration with an existing smartmontools installation and is not bundled by the current build.
 
-No software license has been declared in the repository. Until a license is added, copyright law reserves reuse and redistribution rights to the copyright holder.
+Volume Mount Troubleshooter is released under the [MIT License](LICENSE). Anyone may freely use, copy, modify, merge, publish, distribute, sublicense, or sell copies of the software, including for commercial purposes, provided the copyright and license notice remain with copies or substantial portions. The software is provided without warranty.

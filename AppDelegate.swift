@@ -2,6 +2,12 @@ import AppKit
 import Foundation
 import UniformTypeIdentifiers
 
+private struct MountRequestOutcome {
+    let mountResult: CommandResult
+    let verificationResult: CommandResult
+    let currentInfo: DiskInfoPropertyList?
+}
+
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private let runner = CommandRunner()
@@ -11,16 +17,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var diskMonitor: DiskEventMonitor?
     private var refreshWorkItem: DispatchWorkItem?
     private var unlockRetryWorkItem: DispatchWorkItem?
-    private var snapshot = DiskSnapshot(disks: [], unlockers: [])
+    private var snapshot = DiskSnapshot(disks: [], unlockers: [], scanFailures: [])
     private var window: NSWindow?
     private var textView: NSTextView?
     private var statusLabel: NSTextField?
     private var volumePopup: NSPopUpButton?
     private var volumeDetailLabel: NSTextField?
+    private var smartDetailLabel: NSTextField?
     private var unlockProgressLabel: NSTextField?
-    private var readOnlyCheckbox: NSButton?
     private var redactCheckbox: NSButton?
-    private var startButton: NSButton?
+    private var inspectButton: NSButton?
+    private var mountReadOnlyButton: NSButton?
+    private var mountNormallyButton: NSButton?
+    private var unmountButton: NSButton?
     private var stopButton: NSButton?
     private var refreshButton: NSButton?
     private var ejectButton: NSButton?
@@ -89,7 +98,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         titleLabel.font = NSFont.systemFont(ofSize: 22, weight: .semibold)
 
         let subtitleLabel = NSTextField(
-            wrappingLabelWithString: "Select one external volume, inspect attachment and filesystem evidence, then request a normal or read-only mount. No erase, format, repair, or credential collection."
+            wrappingLabelWithString: "Select one external volume, then choose Inspect, Mount Read-Only, Mount Normally, Unmount Volume, or Safe Eject Disk. No erase, format, repair, or credential collection."
         )
         subtitleLabel.textColor = .secondaryLabelColor
 
@@ -118,21 +127,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         volumeDetailLabel.font = NSFont.systemFont(ofSize: 12)
         self.volumeDetailLabel = volumeDetailLabel
 
+        let smartDetailLabel = NSTextField(wrappingLabelWithString: "")
+        smartDetailLabel.textColor = .secondaryLabelColor
+        smartDetailLabel.font = NSFont.systemFont(ofSize: 12)
+        smartDetailLabel.isHidden = true
+        self.smartDetailLabel = smartDetailLabel
+
         let unlockProgressLabel = NSTextField(wrappingLabelWithString: "")
         unlockProgressLabel.font = NSFont.systemFont(ofSize: 12, weight: .medium)
         unlockProgressLabel.textColor = .systemOrange
         unlockProgressLabel.isHidden = true
         self.unlockProgressLabel = unlockProgressLabel
 
-        let readOnlyCheckbox = NSButton(checkboxWithTitle: "Mount read-only", target: self, action: nil)
-        readOnlyCheckbox.state = .on
-        self.readOnlyCheckbox = readOnlyCheckbox
-
         let redactCheckbox = NSButton(checkboxWithTitle: "Redact shared reports", target: self, action: nil)
         redactCheckbox.state = .on
         self.redactCheckbox = redactCheckbox
 
-        let optionStack = NSStackView(views: [readOnlyCheckbox, redactCheckbox])
+        let optionStack = NSStackView(views: [redactCheckbox])
         optionStack.orientation = .horizontal
         optionStack.spacing = 20
         optionStack.alignment = .centerY
@@ -141,19 +152,59 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusLabel.font = NSFont.systemFont(ofSize: 13, weight: .medium)
         self.statusLabel = statusLabel
 
-        let startButton = NSButton(title: "Start", target: self, action: #selector(startTroubleshooting))
-        startButton.bezelStyle = .rounded
-        startButton.keyEquivalent = "\r"
-        startButton.isEnabled = false
-        self.startButton = startButton
+        let actionLabel = NSTextField(labelWithString: "Selected volume actions:")
+        actionLabel.font = NSFont.systemFont(ofSize: 13, weight: .medium)
+
+        let inspectButton = NSButton(title: "Inspect", target: self, action: #selector(inspectSelectedVolume))
+        inspectButton.bezelStyle = .rounded
+        inspectButton.keyEquivalent = "\r"
+        inspectButton.identifier = NSUserInterfaceItemIdentifier("inspectButton")
+        inspectButton.toolTip = "Collect read-only disk, volume, USB, SMART, encryption, and Disk Arbitration evidence."
+        inspectButton.isEnabled = false
+        self.inspectButton = inspectButton
+
+        let mountReadOnlyButton = NSButton(
+            title: "Mount Read-Only",
+            target: self,
+            action: #selector(mountSelectedVolumeReadOnly)
+        )
+        mountReadOnlyButton.bezelStyle = .rounded
+        mountReadOnlyButton.identifier = NSUserInterfaceItemIdentifier("mountReadOnlyButton")
+        mountReadOnlyButton.toolTip = "Mount the selected volume read-only and verify that macOS reports it as non-writable."
+        mountReadOnlyButton.isEnabled = false
+        self.mountReadOnlyButton = mountReadOnlyButton
+
+        let mountNormallyButton = NSButton(
+            title: "Mount Normally",
+            target: self,
+            action: #selector(mountSelectedVolumeNormally)
+        )
+        mountNormallyButton.bezelStyle = .rounded
+        mountNormallyButton.identifier = NSUserInterfaceItemIdentifier("mountNormallyButton")
+        mountNormallyButton.toolTip = "Mount the selected unmounted volume normally and verify its mount point."
+        mountNormallyButton.isEnabled = false
+        self.mountNormallyButton = mountNormallyButton
+
+        let unmountButton = NSButton(
+            title: "Unmount Volume",
+            target: self,
+            action: #selector(unmountSelectedVolume)
+        )
+        unmountButton.bezelStyle = .rounded
+        unmountButton.identifier = NSUserInterfaceItemIdentifier("unmountVolumeButton")
+        unmountButton.toolTip = "Unmount only the selected volume without ejecting its physical disk."
+        unmountButton.isEnabled = false
+        self.unmountButton = unmountButton
 
         let stopButton = NSButton(title: "Stop", target: self, action: #selector(stopTroubleshooting))
         stopButton.bezelStyle = .rounded
         stopButton.isEnabled = false
         self.stopButton = stopButton
 
-        let ejectButton = NSButton(title: "Safe Eject…", target: self, action: #selector(ejectSelectedDisk))
+        let ejectButton = NSButton(title: "Safe Eject Disk", target: self, action: #selector(ejectSelectedDisk))
         ejectButton.bezelStyle = .rounded
+        ejectButton.identifier = NSUserInterfaceItemIdentifier("safeEjectDiskButton")
+        ejectButton.toolTip = "Eject the selected volume's whole physical disk after confirmation."
         ejectButton.isEnabled = false
         self.ejectButton = ejectButton
 
@@ -182,18 +233,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         revealButton.bezelStyle = .rounded
         self.revealButton = revealButton
 
-        let buttonStack = NSStackView(views: [
-            startButton,
-            stopButton,
+        let actionStack = NSStackView(views: [
+            inspectButton,
+            mountReadOnlyButton,
+            mountNormallyButton,
+            unmountButton,
             ejectButton,
+        ])
+        actionStack.orientation = .horizontal
+        actionStack.spacing = 8
+        actionStack.alignment = .centerY
+
+        let utilityButtonStack = NSStackView(views: [
+            stopButton,
             showUnlockerButton,
             copyButton,
             saveButton,
             revealButton
         ])
-        buttonStack.orientation = .horizontal
-        buttonStack.spacing = 8
-        buttonStack.alignment = .centerY
+        utilityButtonStack.orientation = .horizontal
+        utilityButtonStack.spacing = 8
+        utilityButtonStack.alignment = .centerY
 
         let scrollView = NSScrollView()
         scrollView.hasVerticalScroller = true
@@ -218,10 +278,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             subtitleLabel,
             selectorStack,
             volumeDetailLabel,
+            smartDetailLabel,
             unlockProgressLabel,
             optionStack,
             statusLabel,
-            buttonStack,
+            actionLabel,
+            actionStack,
+            utilityButtonStack,
             scrollView
         ])
         contentStack.orientation = .vertical
@@ -235,10 +298,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             subtitleLabel,
             selectorStack,
             volumeDetailLabel,
+            smartDetailLabel,
             unlockProgressLabel,
             optionStack,
             statusLabel,
-            buttonStack,
+            actionLabel,
+            actionStack,
+            utilityButtonStack,
             scrollView
         ].forEach {
             $0.translatesAutoresizingMaskIntoConstraints = false
@@ -253,10 +319,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             subtitleLabel.widthAnchor.constraint(equalTo: contentStack.widthAnchor),
             selectorStack.widthAnchor.constraint(equalTo: contentStack.widthAnchor),
             volumeDetailLabel.widthAnchor.constraint(equalTo: contentStack.widthAnchor),
+            smartDetailLabel.widthAnchor.constraint(equalTo: contentStack.widthAnchor),
             unlockProgressLabel.widthAnchor.constraint(equalTo: contentStack.widthAnchor),
             optionStack.widthAnchor.constraint(equalTo: contentStack.widthAnchor),
             statusLabel.widthAnchor.constraint(equalTo: contentStack.widthAnchor),
-            buttonStack.widthAnchor.constraint(lessThanOrEqualTo: contentStack.widthAnchor),
+            actionStack.widthAnchor.constraint(lessThanOrEqualTo: contentStack.widthAnchor),
+            utilityButtonStack.widthAnchor.constraint(lessThanOrEqualTo: contentStack.widthAnchor),
             scrollView.widthAnchor.constraint(equalTo: contentStack.widthAnchor),
             scrollView.heightAnchor.constraint(greaterThanOrEqualToConstant: 360)
         ])
@@ -500,7 +568,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if let postRefreshStatus {
             setStatus(postRefreshStatus.message, color: postRefreshStatus.color)
             self.postRefreshStatus = nil
+        } else if !newSnapshot.scanFailures.isEmpty {
+            let failedDiskCount = newSnapshot.scanFailures.count
+            if newSnapshot.volumes.isEmpty {
+                setStatus(
+                    "Disk inventory incomplete — \(failedDiskCount) external disk(s) failed; see console",
+                    color: .systemRed
+                )
+            } else {
+                setStatus(
+                    "Partial inventory — \(failedDiskCount) disk(s) failed; usable volumes remain available",
+                    color: .systemOrange
+                )
+            }
         }
+        appendScanFailures(newSnapshot.scanFailures)
         setControlsForRunningState(false)
 
         let currentIdentifiers = Set(newSnapshot.volumes.map(\.identifier))
@@ -515,6 +597,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
         runPendingAutomaticRefreshIfNeeded()
+    }
+
+    private func appendScanFailures(_ failures: [DiskScanFailure]) {
+        for failure in failures {
+            appendLog(
+                "\nDISK INVENTORY FAILURE: /dev/\(failure.diskIdentifier)\n\(failure.errorDescription)\n"
+            )
+        }
     }
 
     private func updateUnlockTransition() {
@@ -652,6 +742,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func updateSelectionDetails() {
         guard let volume = selectedVolume(), let disk = snapshot.disk(containing: volume) else {
+            smartDetailLabel?.stringValue = ""
+            smartDetailLabel?.isHidden = true
             if let trackedUnlocker {
                 volumeDetailLabel?.stringValue = "Detected \(trackedUnlocker.name), which is the vendor unlock helper rather than the data volume. No application or credential prompt is opened automatically."
                 setStatus("Unlock helper detected — waiting for the data volume", color: .systemOrange)
@@ -666,7 +758,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let encryptionState = volume.isLocked ? "encrypted and locked" : (volume.isEncrypted ? "encrypted and unlocked" : "not encrypted")
         let role = volume.role.map { " • APFS role: \($0)" } ?? ""
         volumeDetailLabel?.stringValue = "\(mountState) • \(encryptionState) • \(formattedByteCount(volume.size)) • \(disk.busProtocol) • SMART: \(disk.smartStatus)\(role)"
-        setStatus("Ready — press Start to diagnose and mount the selected volume", color: .labelColor)
+        let smartLines = [
+            expandedSMARTSummary(disk.expandedSMART),
+            expandedSMARTCaveat(disk.expandedSMART)
+        ].compactMap { $0 }
+        smartDetailLabel?.stringValue = smartLines.joined(separator: "\n")
+        smartDetailLabel?.isHidden = false
+        setStatus("Ready — choose an explicit action for the selected volume", color: .labelColor)
     }
 
     private func selectedVolume() -> ExternalVolume? {
@@ -676,33 +774,73 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return snapshot.volumes[index]
     }
 
-    @objc private func startTroubleshooting() {
+    @objc private func inspectSelectedVolume() {
         guard !isRunning, let volume = selectedVolume(), let disk = snapshot.disk(containing: volume) else {
             return
         }
+        guard volumeActionAvailability(for: volume).inspect else {
+            return
+        }
 
-        let readOnly = readOnlyCheckbox?.state == .on
-        let requiresReadOnlyRemount = readOnly && volume.mountPoint != nil && volume.isWritable
+        beginOperation(status: "Inspecting \(volume.name)…")
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            self?.performInspection(volume: volume, disk: disk, runner: self?.runner)
+        }
+    }
+
+    @objc private func mountSelectedVolumeReadOnly() {
+        guard !isRunning, let volume = selectedVolume(), let disk = snapshot.disk(containing: volume) else {
+            return
+        }
+        guard volumeActionAvailability(for: volume).mountReadOnly else {
+            return
+        }
+        let requiresReadOnlyRemount = nonEmpty(volume.mountPoint) != nil && volume.isWritable
         if requiresReadOnlyRemount && !confirmReadOnlyRemount(volume: volume) {
             return
         }
 
+        beginOperation(status: "Mounting \(volume.name) read-only…")
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            self?.performReadOnlyMount(volume: volume, disk: disk, runner: self?.runner)
+        }
+    }
+
+    @objc private func mountSelectedVolumeNormally() {
+        guard !isRunning, let volume = selectedVolume(), let disk = snapshot.disk(containing: volume) else {
+            return
+        }
+        guard volumeActionAvailability(for: volume).mountNormally else {
+            return
+        }
+
+        beginOperation(status: "Mounting \(volume.name) normally…")
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            self?.performNormalMount(volume: volume, disk: disk, runner: self?.runner)
+        }
+    }
+
+    @objc private func unmountSelectedVolume() {
+        guard !isRunning, let volume = selectedVolume(), let disk = snapshot.disk(containing: volume) else {
+            return
+        }
+        guard volumeActionAvailability(for: volume).unmountVolume else {
+            return
+        }
+
+        beginOperation(status: "Unmounting \(volume.name)…")
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            self?.performUnmount(volume: volume, disk: disk, runner: self?.runner)
+        }
+    }
+
+    private func beginOperation(status: String) {
         isRunning = true
         completeLog = ""
         textView?.string = ""
         runner.reset()
         setControlsForRunningState(true)
-        setStatus("Running diagnostics for \(volume.name)…", color: .systemBlue)
-
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            self?.performTroubleshooting(
-                volume: volume,
-                disk: disk,
-                readOnly: readOnly,
-                requiresReadOnlyRemount: requiresReadOnlyRemount,
-                runner: self?.runner
-            )
-        }
+        setStatus(status, color: .systemBlue)
     }
 
     private func confirmReadOnlyRemount(volume: ExternalVolume) -> Bool {
@@ -722,31 +860,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func ejectSelectedDisk() {
-        guard !isRunning, let volume = selectedVolume() else {
+        guard
+            !isRunning,
+            let volume = selectedVolume(),
+            let disk = snapshot.disk(containing: volume)
+        else {
+            return
+        }
+        guard volumeActionAvailability(for: volume).safeEjectDisk else {
             return
         }
         let alert = NSAlert()
         alert.messageText = "Safely eject /dev/\(volume.wholeDiskIdentifier)?"
         alert.informativeText = "This ejects the whole external physical disk, including any sibling volumes. Close files using them first."
         alert.alertStyle = .warning
-        alert.addButton(withTitle: "Safe Eject")
+        alert.addButton(withTitle: "Safe Eject Disk")
         alert.addButton(withTitle: "Cancel")
         guard alert.runModal() == .alertFirstButtonReturn else {
             return
         }
 
-        isRunning = true
-        completeLog = ""
-        textView?.string = ""
-        runner.reset()
-        setControlsForRunningState(true)
-        setStatus("Ejecting external disk…", color: .systemBlue)
+        beginOperation(status: "Ejecting external disk…")
         let devicePath = "/dev/\(volume.wholeDiskIdentifier)"
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self else {
                 return
             }
+            self.postOperationHeader(action: "Safe Eject Disk", volume: volume, disk: disk)
             do {
                 let result = try self.runLogged(
                     executable: "/usr/sbin/diskutil",
@@ -828,11 +969,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSWorkspace.shared.open(URL(fileURLWithPath: "/Volumes", isDirectory: true))
     }
 
-    nonisolated private func performTroubleshooting(
+    nonisolated private func performInspection(
         volume: ExternalVolume,
         disk: ExternalDisk,
-        readOnly: Bool,
-        requiresReadOnlyRemount: Bool,
         runner: CommandRunner?
     ) {
         guard let runner else {
@@ -840,54 +979,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
-        postLog("Volume Mount Troubleshooter\n")
-        postLog("Started: \(ISO8601DateFormatter().string(from: Date()))\n")
-        postLog("Selected: \(volume.name) (/dev/\(volume.identifier)) on /dev/\(disk.identifier)\n")
-        postLog("Requested mode: \(readOnly ? "read-only" : "normal")\n")
-        postLog("Safety: no repair, erase, format, or credential commands.\n\n")
-
+        postOperationHeader(action: "Inspect", volume: volume, disk: disk)
         do {
-            let profiler = try runLogged(
-                executable: "/usr/sbin/system_profiler",
-                arguments: ["SPUSBDataType", "SPThunderboltDataType", "-detailLevel", "mini"],
-                runner: runner
-            )
-            if profiler.exitStatus != 0 {
-                postLog("WARNING: System Profiler failed; diskutil remains the authoritative storage inventory.\n\n")
-            }
+            try collectInspectionEvidence(volume: volume, disk: disk, runner: runner)
+            try appendDiskArbitrationErrors(runner: runner)
+            finishSuccess("Inspection complete for \(volume.name)")
+        } catch TroubleshooterError.cancelled {
+            finishCancelled()
+        } catch let error as TroubleshooterError {
+            postLog("\nFATAL: \(error.localizedDescription)\n")
+            finishFailure(error.localizedDescription)
+        } catch {
+            postLog("\nFATAL: Unexpected execution error: \(error.localizedDescription)\n")
+            finishFailure("Unexpected execution error: \(error.localizedDescription)")
+        }
+    }
 
-            _ = try runLogged(
-                executable: "/usr/sbin/diskutil",
-                arguments: ["list", "external", "physical"],
-                runner: runner
-            )
-            _ = try runLogged(
-                executable: "/usr/sbin/diskutil",
-                arguments: ["info", "/dev/\(disk.identifier)"],
-                runner: runner
-            )
-            postLog("DEVICE HEALTH: bus=\(disk.busProtocol), SMART=\(disk.smartStatus), size=\(formattedByteCount(disk.size))\n\n")
+    nonisolated private func performReadOnlyMount(
+        volume: ExternalVolume,
+        disk: ExternalDisk,
+        runner: CommandRunner?
+    ) {
+        guard let runner else {
+            finishFailure("Command runner was unavailable")
+            return
+        }
 
-            let ioreg = try runCaptured(
-                executable: "/usr/sbin/ioreg",
-                arguments: ["-p", "IOUSB", "-l", "-w0"],
-                reason: "raw output omitted because it can contain hardware serial identifiers",
-                runner: runner
-            )
-            if let speed = usbLinkSpeedBitsPerSecond(from: ioreg.output, productName: disk.name) {
-                postLog("USB CONNECTION SPEED: \(formattedLinkSpeed(speed)) for \(disk.name)\n\n")
-            } else {
-                postLog("USB CONNECTION SPEED: unavailable for \(disk.name); the device may use a path not exposed in the IOUSB plane.\n\n")
-            }
-
-            _ = try runLogged(
-                executable: "/usr/sbin/diskutil",
-                arguments: ["info", "/dev/\(volume.identifier)"],
-                runner: runner
-            )
-            let encryptionState = volume.isLocked ? "encrypted and locked" : (volume.isEncrypted ? "encrypted and unlocked" : "not encrypted")
-            postLog("ENCRYPTION CHECK: \(encryptionState). No credentials were requested.\n\n")
-
+        postOperationHeader(action: "Mount Read-Only", volume: volume, disk: disk)
+        do {
+            try collectInspectionEvidence(volume: volume, disk: disk, runner: runner)
             guard !volume.isLocked else {
                 postLog(guidedFailureExplanation(exitStatus: 1, output: "volume locked", volume: volume) + "\n")
                 try appendDiskArbitrationErrors(runner: runner)
@@ -895,7 +1015,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 return
             }
 
-            if requiresReadOnlyRemount {
+            if nonEmpty(volume.mountPoint) != nil, volume.isWritable {
                 let unmount = try runLogged(
                     executable: "/usr/sbin/diskutil",
                     arguments: ["unmount", "/dev/\(volume.identifier)"],
@@ -909,52 +1029,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
             }
 
-            let mountArguments = readOnly
-                ? ["mount", "readOnly", "/dev/\(volume.identifier)"]
-                : ["mount", "/dev/\(volume.identifier)"]
-            let mountResult = try runLogged(
-                executable: "/usr/sbin/diskutil",
-                arguments: mountArguments,
+            let outcome = try runMountRequest(
+                volume: volume,
+                arguments: ["mount", "readOnly", "/dev/\(volume.identifier)"],
                 runner: runner
-            )
-
-            let verifyArguments = ["info", "-plist", "/dev/\(volume.identifier)"]
-            let verification = try runCaptured(
-                executable: "/usr/sbin/diskutil",
-                arguments: verifyArguments,
-                reason: "structured plist decoded for mount verification",
-                runner: runner
-            )
-            guard verification.exitStatus == 0 else {
-                postLog(guidedFailureExplanation(exitStatus: verification.exitStatus, output: verification.output, volume: volume) + "\n")
-                try appendDiskArbitrationErrors(runner: runner)
-                finishFailure("Could not verify /dev/\(volume.identifier) after the mount request")
-                return
-            }
-            let currentInfo = try decodePropertyList(
-                DiskInfoPropertyList.self,
-                output: verification.output,
-                command: renderedCommand(executable: "/usr/sbin/diskutil", arguments: verifyArguments)
             )
             try appendDiskArbitrationErrors(runner: runner)
 
-            guard mountResult.exitStatus == 0 else {
-                postLog(guidedFailureExplanation(exitStatus: mountResult.exitStatus, output: mountResult.output, volume: volume) + "\n")
-                finishFailure("Mount failed for /dev/\(volume.identifier)")
+            guard outcome.mountResult.exitStatus == 0 else {
+                postLog(guidedFailureExplanation(exitStatus: outcome.mountResult.exitStatus, output: outcome.mountResult.output, volume: volume) + "\n")
+                finishFailure("Read-only mount failed for /dev/\(volume.identifier)")
+                return
+            }
+            guard outcome.verificationResult.exitStatus == 0, let currentInfo = outcome.currentInfo else {
+                postLog(guidedFailureExplanation(exitStatus: outcome.verificationResult.exitStatus, output: outcome.verificationResult.output, volume: volume) + "\n")
+                finishFailure("Could not verify /dev/\(volume.identifier) after the mount request")
                 return
             }
             guard let mountPoint = nonEmpty(currentInfo.mountPoint) else {
-                postLog(guidedFailureExplanation(exitStatus: 0, output: mountResult.output, volume: volume) + "\n")
+                postLog(guidedFailureExplanation(exitStatus: 0, output: outcome.mountResult.output, volume: volume) + "\n")
                 finishFailure("Mount command succeeded, but no mount point was verified")
                 return
             }
-            if readOnly, currentInfo.writableVolume == true {
+            if currentInfo.writableVolume == true {
                 postLog("GUIDED EXPLANATION: macOS mounted the volume writable even though read-only was requested.\n")
                 finishFailure("Read-only state was not verified at \(mountPoint)")
                 return
             }
 
-            postLog("VERIFIED MOUNT: \(mountPoint) (\(readOnly ? "read-only" : "normal"))\n")
+            postLog("VERIFIED MOUNT: \(mountPoint) (read-only)\n")
             finishSuccess("Mounted \(volume.name) at \(mountPoint)")
         } catch TroubleshooterError.cancelled {
             finishCancelled()
@@ -965,6 +1068,212 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             postLog("\nFATAL: Unexpected execution error: \(error.localizedDescription)\n")
             finishFailure("Unexpected execution error: \(error.localizedDescription)")
         }
+    }
+
+    nonisolated private func performNormalMount(
+        volume: ExternalVolume,
+        disk: ExternalDisk,
+        runner: CommandRunner?
+    ) {
+        guard let runner else {
+            finishFailure("Command runner was unavailable")
+            return
+        }
+
+        postOperationHeader(action: "Mount Normally", volume: volume, disk: disk)
+        do {
+            try collectInspectionEvidence(volume: volume, disk: disk, runner: runner)
+            guard !volume.isLocked else {
+                postLog(guidedFailureExplanation(exitStatus: 1, output: "volume locked", volume: volume) + "\n")
+                try appendDiskArbitrationErrors(runner: runner)
+                finishFailure("Selected volume is encrypted and locked")
+                return
+            }
+
+            let outcome = try runMountRequest(
+                volume: volume,
+                arguments: ["mount", "/dev/\(volume.identifier)"],
+                runner: runner
+            )
+            try appendDiskArbitrationErrors(runner: runner)
+            guard outcome.mountResult.exitStatus == 0 else {
+                postLog(guidedFailureExplanation(exitStatus: outcome.mountResult.exitStatus, output: outcome.mountResult.output, volume: volume) + "\n")
+                finishFailure("Normal mount failed for /dev/\(volume.identifier)")
+                return
+            }
+            guard outcome.verificationResult.exitStatus == 0, let currentInfo = outcome.currentInfo else {
+                postLog(guidedFailureExplanation(exitStatus: outcome.verificationResult.exitStatus, output: outcome.verificationResult.output, volume: volume) + "\n")
+                finishFailure("Could not verify /dev/\(volume.identifier) after the mount request")
+                return
+            }
+            guard let mountPoint = nonEmpty(currentInfo.mountPoint) else {
+                postLog(guidedFailureExplanation(exitStatus: 0, output: outcome.mountResult.output, volume: volume) + "\n")
+                finishFailure("Mount command succeeded, but no mount point was verified")
+                return
+            }
+
+            postLog("VERIFIED MOUNT: \(mountPoint) (normal)\n")
+            finishSuccess("Mounted \(volume.name) at \(mountPoint)")
+        } catch TroubleshooterError.cancelled {
+            finishCancelled()
+        } catch let error as TroubleshooterError {
+            postLog("\nFATAL: \(error.localizedDescription)\n")
+            finishFailure(error.localizedDescription)
+        } catch {
+            postLog("\nFATAL: Unexpected execution error: \(error.localizedDescription)\n")
+            finishFailure("Unexpected execution error: \(error.localizedDescription)")
+        }
+    }
+
+    nonisolated private func performUnmount(
+        volume: ExternalVolume,
+        disk: ExternalDisk,
+        runner: CommandRunner?
+    ) {
+        guard let runner else {
+            finishFailure("Command runner was unavailable")
+            return
+        }
+
+        postOperationHeader(action: "Unmount Volume", volume: volume, disk: disk)
+        do {
+            let result = try runLogged(
+                executable: "/usr/sbin/diskutil",
+                arguments: ["unmount", "/dev/\(volume.identifier)"],
+                runner: runner
+            )
+            try appendDiskArbitrationErrors(runner: runner)
+            guard result.exitStatus == 0 else {
+                postLog(guidedFailureExplanation(exitStatus: result.exitStatus, output: result.output, volume: volume) + "\n")
+                finishFailure("Unmount failed for /dev/\(volume.identifier)")
+                return
+            }
+            finishSuccess("Unmounted /dev/\(volume.identifier)")
+        } catch TroubleshooterError.cancelled {
+            finishCancelled()
+        } catch let error as TroubleshooterError {
+            postLog("\nFATAL: \(error.localizedDescription)\n")
+            finishFailure(error.localizedDescription)
+        } catch {
+            postLog("\nFATAL: Unexpected execution error: \(error.localizedDescription)\n")
+            finishFailure("Unexpected execution error: \(error.localizedDescription)")
+        }
+    }
+
+    nonisolated private func postOperationHeader(
+        action: String,
+        volume: ExternalVolume,
+        disk: ExternalDisk
+    ) {
+        postLog("Volume Mount Troubleshooter\n")
+        postLog("Started: \(ISO8601DateFormatter().string(from: Date()))\n")
+        postLog("Selected: \(volume.name) (/dev/\(volume.identifier)) on /dev/\(disk.identifier)\n")
+        postLog("Explicit action: \(action)\n")
+        postLog("Safety: no repair, erase, format, force-unmount, or credential commands.\n\n")
+    }
+
+    nonisolated private func collectInspectionEvidence(
+        volume: ExternalVolume,
+        disk: ExternalDisk,
+        runner: CommandRunner
+    ) throws {
+        let profiler = try runLogged(
+            executable: "/usr/sbin/system_profiler",
+            arguments: ["SPUSBDataType", "SPThunderboltDataType", "-detailLevel", "mini"],
+            runner: runner
+        )
+        if profiler.exitStatus != 0 {
+            postLog("WARNING: System Profiler failed; diskutil remains the authoritative storage inventory.\n\n")
+        }
+
+        let externalList = try runLogged(
+            executable: "/usr/sbin/diskutil",
+            arguments: ["list", "external", "physical"],
+            runner: runner
+        )
+        guard externalList.exitStatus == 0 else {
+            throw TroubleshooterError.commandFailed(
+                command: "/usr/sbin/diskutil list external physical",
+                exitStatus: externalList.exitStatus,
+                output: externalList.output
+            )
+        }
+        let diskInfo = try runLogged(
+            executable: "/usr/sbin/diskutil",
+            arguments: ["info", "/dev/\(disk.identifier)"],
+            runner: runner
+        )
+        guard diskInfo.exitStatus == 0 else {
+            throw TroubleshooterError.commandFailed(
+                command: "/usr/sbin/diskutil info /dev/\(disk.identifier)",
+                exitStatus: diskInfo.exitStatus,
+                output: diskInfo.output
+            )
+        }
+        postLog("DEVICE HEALTH: bus=\(disk.busProtocol), SMART=\(disk.smartStatus), size=\(formattedByteCount(disk.size))\n\n")
+        postLog("\(expandedSMARTSummary(disk.expandedSMART))\n")
+        if let caveat = expandedSMARTCaveat(disk.expandedSMART) {
+            postLog("\(caveat)\n")
+        }
+        postLog("\n")
+
+        let ioreg = try runCaptured(
+            executable: "/usr/sbin/ioreg",
+            arguments: ["-p", "IOUSB", "-l", "-w0"],
+            reason: "raw output omitted because it can contain hardware serial identifiers",
+            runner: runner
+        )
+        if let speed = usbLinkSpeedBitsPerSecond(from: ioreg.output, productName: disk.name) {
+            postLog("USB CONNECTION SPEED: \(formattedLinkSpeed(speed)) for \(disk.name)\n\n")
+        } else {
+            postLog("USB CONNECTION SPEED: unavailable for \(disk.name); the device may use a path not exposed in the IOUSB plane.\n\n")
+        }
+
+        let volumeInfo = try runLogged(
+            executable: "/usr/sbin/diskutil",
+            arguments: ["info", "/dev/\(volume.identifier)"],
+            runner: runner
+        )
+        guard volumeInfo.exitStatus == 0 else {
+            throw TroubleshooterError.commandFailed(
+                command: "/usr/sbin/diskutil info /dev/\(volume.identifier)",
+                exitStatus: volumeInfo.exitStatus,
+                output: volumeInfo.output
+            )
+        }
+        let encryptionState = volume.isLocked ? "encrypted and locked" : (volume.isEncrypted ? "encrypted and unlocked" : "not encrypted")
+        postLog("ENCRYPTION CHECK: \(encryptionState). No credentials were requested.\n\n")
+    }
+
+    nonisolated private func runMountRequest(
+        volume: ExternalVolume,
+        arguments: [String],
+        runner: CommandRunner
+    ) throws -> MountRequestOutcome {
+        let mountResult = try runLogged(
+            executable: "/usr/sbin/diskutil",
+            arguments: arguments,
+            runner: runner
+        )
+        let verifyArguments = ["info", "-plist", "/dev/\(volume.identifier)"]
+        let verificationResult = try runCaptured(
+            executable: "/usr/sbin/diskutil",
+            arguments: verifyArguments,
+            reason: "structured plist decoded for mount verification",
+            runner: runner
+        )
+        let currentInfo = verificationResult.exitStatus == 0
+            ? try decodePropertyList(
+                DiskInfoPropertyList.self,
+                output: verificationResult.output,
+                command: renderedCommand(executable: "/usr/sbin/diskutil", arguments: verifyArguments)
+            )
+            : nil
+        return MountRequestOutcome(
+            mountResult: mountResult,
+            verificationResult: verificationResult,
+            currentInfo: currentInfo
+        )
     }
 
     nonisolated private func appendDiskArbitrationErrors(runner: CommandRunner) throws {
@@ -1073,15 +1382,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func setControlsForRunningState(_ running: Bool) {
-        let hasSelection = selectedVolume() != nil
-        startButton?.isEnabled = !running && hasSelection && !isRefreshing
+        let availability = volumeActionAvailability(for: selectedVolume())
+        let actionsEnabled = !running && !isRefreshing
+        inspectButton?.isEnabled = actionsEnabled && availability.inspect
+        mountReadOnlyButton?.isEnabled = actionsEnabled && availability.mountReadOnly
+        mountNormallyButton?.isEnabled = actionsEnabled && availability.mountNormally
+        unmountButton?.isEnabled = actionsEnabled && availability.unmountVolume
         stopButton?.isEnabled = running
         refreshButton?.isEnabled = !running && !isRefreshing
-        ejectButton?.isEnabled = !running && hasSelection && !isRefreshing
+        ejectButton?.isEnabled = actionsEnabled && availability.safeEjectDisk
         let hasUnlockerMountPoint = nonEmpty(trackedUnlocker?.mountPoint) != nil
         showUnlockerButton?.isEnabled = !running && !isRefreshing && hasUnlockerMountPoint
         volumePopup?.isEnabled = !running && !isRefreshing && !snapshot.volumes.isEmpty
-        readOnlyCheckbox?.isEnabled = !running
         copyButton?.isEnabled = !running && !completeLog.isEmpty
         saveButton?.isEnabled = !running && !completeLog.isEmpty
         revealButton?.isEnabled = !running

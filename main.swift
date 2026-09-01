@@ -28,11 +28,18 @@ struct VolumeMountTroubleshooterApplication {
                 ) { _ in }
                 for disk in snapshot.disks {
                     print("DISK \(disk.identifier) | \(disk.name) | \(disk.busProtocol) | SMART \(disk.smartStatus)")
+                    print("SMART_DETAILS \(expandedSMARTSummary(disk.expandedSMART))")
+                    if let caveat = expandedSMARTCaveat(disk.expandedSMART) {
+                        print("SMART_CAVEAT \(caveat)")
+                    }
                     let speed = usbLinkSpeedBitsPerSecond(from: ioreg.output, productName: disk.name)
                     print("USB_SPEED \(speed.map(formattedLinkSpeed) ?? "unavailable")")
                     for volume in disk.volumes {
                         print("VOLUME \(volume.identifier) | \(volume.name) | \(volume.filesystem) | mounted=\(volume.mountPoint != nil) | encrypted=\(volume.isEncrypted) | locked=\(volume.isLocked)")
                     }
+                }
+                for failure in snapshot.scanFailures {
+                    print("DISK_ERROR \(failure.diskIdentifier)\n\(failure.errorDescription)")
                 }
                 exit(0)
             } catch {
