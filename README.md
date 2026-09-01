@@ -1,19 +1,20 @@
 # Volume Mount Troubleshooter — macOS External Disk Diagnostics
 
-### Transparent, non-destructive volume detection and mounting for Apple Silicon Macs
+### Transparent, non-destructive volume detection and mounting for Intel and Apple Silicon Macs
 
 <p align="center">
   <img src="assets/AppIcon.png" width="260" alt="Volume Mount Troubleshooter logo">
 </p>
 
 ![Platform](https://img.shields.io/badge/platform-macOS-000000?logo=apple&logoColor=white)
-![Architecture](https://img.shields.io/badge/architecture-Apple%20Silicon-8250df)
+![Architecture](https://img.shields.io/badge/architecture-universal%20arm64%20%2B%20x86__64-8250df)
 ![Swift](https://img.shields.io/badge/Swift-5%20language%20mode-F05138?logo=swift&logoColor=white)
 ![Version](https://img.shields.io/badge/version-0.2-0969da)
 ![Controls](https://img.shields.io/badge/controls-explicit%20actions-1a7f37)
 ![Dependencies](https://img.shields.io/badge/required%20third--party%20dependencies-none-1a7f37)
 ![Network](https://img.shields.io/badge/network%20access-none-1a7f37)
 ![License](https://img.shields.io/badge/license-MIT-1a7f37)
+[![macOS CI](https://github.com/hideouts-io/VolumeMountTroubleshooter/actions/workflows/macos-ci.yml/badge.svg)](https://github.com/hideouts-io/VolumeMountTroubleshooter/actions/workflows/macos-ci.yml)
 
 > **Scope:** Volume Mount Troubleshooter is a native macOS utility for identifying attached external storage, selecting one user-facing volume, and explicitly inspecting, mounting, unmounting, or safely ejecting it. It does not erase, partition, format, repair, force-eject, unlock encrypted storage, collect credentials, or prove that a disk is healthy. Every operational command and exit status is visible in the built-in console.
 
@@ -220,7 +221,7 @@ flowchart TB
 ## Requirements
 
 - macOS 13 or newer;
-- an Apple Silicon Mac (`arm64`);
+- an Apple Silicon (`arm64`) or Intel (`x86_64`) Mac;
 - Xcode or the Xcode command-line tools for building;
 - a standard signed-in user account; and
 - an external storage device visible to macOS.
@@ -244,17 +245,21 @@ open "build/Volume Mount Troubleshooter.app"
 The build script:
 
 1. creates the `.app` bundle under `build/`;
-2. compiles the Swift sources for Apple Silicon and macOS 13+;
-3. links AppKit and Disk Arbitration;
-4. runs the built-in parser and privacy-redaction self-test;
-5. applies an ad-hoc code signature; and
-6. verifies the bundle with strict code-signature validation.
+2. compiles separate `arm64` and `x86_64` slices for macOS 13+;
+3. combines the slices into one universal executable with Apple `lipo`;
+4. verifies that both architectures are present;
+5. links AppKit and Disk Arbitration;
+6. runs the built-in parser and privacy-redaction self-test;
+7. applies an ad-hoc code signature to the completed universal bundle; and
+8. verifies the bundle with strict code-signature validation.
 
 The generated application is:
 
 ```text
 build/Volume Mount Troubleshooter.app
 ```
+
+The previously published v0.2 `macos-arm64` release asset remains Apple-Silicon-only. A release is universal only when its filename ends in `macOS-universal.zip` and its checksum matches the accompanying `SHA256SUMS.txt` file.
 
 ---
 
@@ -572,6 +577,43 @@ The self-test covers:
 - USB link-speed extraction; and
 - privacy redaction of serial numbers and UUIDs.
 
+### Universal release archive and checksum
+
+```sh
+./script/build_release.sh
+```
+
+This produces two ignored files under `dist/`:
+
+```text
+VolumeMountTroubleshooter-vVERSION-macOS-universal.zip
+VolumeMountTroubleshooter-vVERSION-SHA256SUMS.txt
+```
+
+The packaging script rebuilds the app, verifies its universal architecture set and strict ad-hoc signature, creates the ZIP, generates its SHA-256 checksum, extracts the ZIP into a temporary directory, re-verifies the signature and architectures, and runs the self-tests from the extracted bundle.
+
+You can repeat the checksum verification with:
+
+```sh
+cd dist
+shasum -a 256 -c VolumeMountTroubleshooter-v*-SHA256SUMS.txt
+```
+
+Ad-hoc signing detects accidental bundle changes but is not Developer ID signing or Apple notarization.
+
+### GitHub Actions
+
+The [`macOS CI` workflow](.github/workflows/macos-ci.yml) runs on every branch push, pull request, `v*` tag push, published release, and manual dispatch. It:
+
+1. builds the universal app on GitHub's Apple Silicon `macos-15` runner;
+2. runs self-tests and strict signature verification;
+3. packages the app and produces a SHA-256 checksum;
+4. uploads the ZIP and checksum as immutable workflow artifacts;
+5. downloads that exact package on `macos-15-intel` and repeats checksum, architecture, signature, and native Intel self-test validation; and
+6. attaches both verified files to an existing GitHub Release when that release is published.
+
+A `v*` tag must exactly match `CFBundleShortVersionString`, such as tag `v0.3` for app version `0.3`, or the release workflow fails before packaging. GitHub documents `macos-15` as arm64 and `macos-15-intel` as Intel runner labels, while artifact uploads expose a SHA-256 digest in addition to the project's downloadable checksum file. [GitHub-hosted runner reference](https://docs.github.com/en/actions/how-tos/write-workflows/choose-where-workflows-run/choose-the-runner-for-a-job), [workflow artifact validation](https://docs.github.com/en/actions/tutorials/store-and-share-data)
+
 ### Live read-only scanner integration test
 
 ```sh
@@ -603,6 +645,7 @@ Matrix rows remain `NOT RUN`, `BLOCKED`, `FAIL`, or `HISTORICAL` until the behav
 
 ```text
 VolumeMountTroubleshooter/
+├── .github/workflows/macos-ci.yml # Universal build and release validation
 ├── AppDelegate.swift       # AppKit window, controls, actions, and workflow
 ├── assets/AppIcon.png      # Canonical project logo source
 ├── assets/AppIcon.icns     # Multi-resolution macOS application icon
@@ -612,19 +655,20 @@ VolumeMountTroubleshooter/
 ├── main.swift              # Application entry point and test modes
 ├── Info.plist              # macOS bundle metadata
 ├── build.sh                # Build, self-test, signing, and verification
+├── script/build_release.sh # Universal ZIP and SHA-256 generation
 ├── script/build_and_run.sh # Build and launch entrypoint for local debugging
+├── script/verify_release.sh # Extracted release and native-slice verification
 ├── README.md               # Project documentation
 ├── LICENSE                 # MIT software license
 └── .gitignore              # Excludes generated build output
 ```
 
-Generated applications under `build/` are intentionally not tracked by Git.
+Generated applications under `build/` and release files under `dist/` are intentionally not tracked by Git.
 
 ---
 
 ## Current Limitations
 
-- The build script currently targets Apple Silicon only.
 - The app is ad-hoc signed, not Developer ID signed, notarized, or distributed as a DMG or installer package.
 - Only external physical storage published by `diskutil` is considered. Internal disks, disk images, network shares, and cloud-storage providers are outside scope.
 - System Profiler may omit a connected USB device even when `diskutil` and IOKit report it.
@@ -701,7 +745,7 @@ Preserve original error output before attempting repair. Never erase or format a
 
 ## Project Status and License
 
-Volume Mount Troubleshooter is an early native macOS utility. The source, parser self-test, live read-only scanner test, ad-hoc application build, and strict signature verification are available in this repository.
+Volume Mount Troubleshooter is an early native macOS utility. The source builds as one universal `arm64 + x86_64` app. Parser self-tests, a live read-only scanner test, deterministic ZIP and checksum generation, strict ad-hoc signature verification, and native CI validation on Apple Silicon and Intel runners are available in this repository.
 
 The project has no required third-party runtime dependencies, no telemetry, no network access, and no privileged helper. Expanded SMART collection is an optional integration with an existing smartmontools installation and is not bundled by the current build.
 
