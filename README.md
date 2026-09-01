@@ -603,14 +603,14 @@ Ad-hoc signing detects accidental bundle changes but is not Developer ID signing
 
 ### GitHub Actions
 
-The [`macOS CI` workflow](.github/workflows/macos-ci.yml) runs on every branch push, pull request, `v*` tag push, published release, and manual dispatch. It:
+The [`macOS CI` workflow](.github/workflows/macos-ci.yml) runs on every branch push, pull request, `v*` tag push, and manual dispatch. It:
 
 1. builds the universal app on GitHub's Apple Silicon `macos-15` runner;
 2. runs self-tests and strict signature verification;
 3. packages the app and produces a SHA-256 checksum;
 4. uploads the ZIP and checksum as immutable workflow artifacts;
 5. downloads that exact package on `macos-15-intel` and repeats checksum, architecture, signature, and native Intel self-test validation; and
-6. attaches both verified files to an existing GitHub Release when that release is published.
+6. after a `v*` tag passes every validation job, creates the GitHub Release with both assets and publishes it atomically.
 
 A `v*` tag must exactly match `CFBundleShortVersionString`, such as tag `v0.3.0` for app version `0.3.0`, or the release workflow fails before packaging. GitHub documents `macos-15` as arm64 and `macos-15-intel` as Intel runner labels, while artifact uploads expose a SHA-256 digest in addition to the project's downloadable checksum file. [GitHub-hosted runner reference](https://docs.github.com/en/actions/how-tos/write-workflows/choose-where-workflows-run/choose-the-runner-for-a-job), [workflow artifact validation](https://docs.github.com/en/actions/tutorials/store-and-share-data)
 

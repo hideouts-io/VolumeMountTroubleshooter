@@ -3,8 +3,6 @@ name: macOS CI
 on:
   push: {}
   pull_request: {}
-  release:
-    types: [published]
   workflow_dispatch: {}
 
 permissions:
@@ -26,7 +24,7 @@ jobs:
           persist-credentials: false
 
       - name: Validate release tag against app version
-        if: github.event_name == 'release' || startsWith(github.ref, 'refs/tags/v')
+        if: startsWith(github.ref, 'refs/tags/v')
         env:
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
@@ -79,9 +77,9 @@ jobs:
             "dist/VolumeMountTroubleshooter-v$app_version-macOS-universal.zip" \
             "dist/VolumeMountTroubleshooter-v$app_version-SHA256SUMS.txt"
 
-  publish-release-assets:
-    name: Attach verified files to published release
-    if: github.event_name == 'release'
+  publish-release:
+    name: Publish verified tagged release
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     needs: [build-universal, verify-intel]
     runs-on: ubuntu-latest
     permissions:
@@ -94,8 +92,14 @@ jobs:
           name: VolumeMountTroubleshooter-macOS-universal-${{ github.sha }}
           path: dist
 
-      - name: Upload assets to the published release
+      - name: Publish release with verified assets
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
-        run: gh release upload "$RELEASE_TAG" dist/* --clobber --repo "$GITHUB_REPOSITORY"
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$RELEASE_TAG" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --title "Volume Mount Troubleshooter $RELEASE_TAG" \
+            --generate-notes \
+            --latest
