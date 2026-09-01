@@ -1,5 +1,24 @@
 import DiskArbitration
+import Darwin
 import Foundation
+
+private final class CommandOutputBuffer: @unchecked Sendable {
+    private let lock = NSLock()
+    private var output = ""
+
+    func append(_ text: String) {
+        lock.lock()
+        output.append(text)
+        lock.unlock()
+    }
+
+    func value() -> String {
+        lock.lock()
+        let result = output
+        lock.unlock()
+        return result
+    }
+}
 
 final class CommandRunner: @unchecked Sendable {
     private let lock = NSLock()
@@ -30,6 +49,7 @@ final class CommandRunner: @unchecked Sendable {
     func run(
         executable: String,
         arguments: [String],
+        timeoutSeconds: TimeInterval,
         onOutput: @escaping (String) -> Void
     ) throws -> CommandResult {
         let process = Process()
@@ -49,6 +69,11 @@ final class CommandRunner: @unchecked Sendable {
             lock.unlock()
         }
 
+        let processFinished = DispatchSemaphore(value: 0)
+        process.terminationHandler = { _ in
+            processFinished.signal()
+        }
+
         do {
             try process.run()
         } catch {
@@ -58,23 +83,45 @@ final class CommandRunner: @unchecked Sendable {
             )
         }
 
-        var completeOutput = ""
+        let outputBuffer = CommandOutputBuffer()
         let readHandle = outputPipe.fileHandleForReading
-        while true {
-            let data = readHandle.availableData
-            if data.isEmpty {
-                break
+        let outputGroup = DispatchGroup()
+        outputGroup.enter()
+        DispatchQueue.global(qos: .utility).async {
+            defer {
+                outputGroup.leave()
             }
-            let chunk = String(decoding: data, as: UTF8.self)
-            completeOutput.append(chunk)
-            onOutput(chunk)
+            while true {
+                let data = readHandle.availableData
+                if data.isEmpty {
+                    break
+                }
+                let chunk = String(decoding: data, as: UTF8.self)
+                outputBuffer.append(chunk)
+                onOutput(chunk)
+            }
         }
 
-        process.waitUntilExit()
+        let waitResult = processFinished.wait(timeout: .now() + timeoutSeconds)
+        if waitResult == .timedOut {
+            process.terminate()
+            if processFinished.wait(timeout: .now() + 2) == .timedOut {
+                Darwin.kill(process.processIdentifier, SIGKILL)
+                processFinished.wait()
+            }
+        }
+        outputGroup.wait()
+
         if isCancelled() {
             throw TroubleshooterError.cancelled
         }
-        return CommandResult(exitStatus: process.terminationStatus, output: completeOutput)
+        if waitResult == .timedOut {
+            throw TroubleshooterError.commandTimedOut(
+                command: renderedCommand(executable: executable, arguments: arguments),
+                timeoutSeconds: timeoutSeconds
+            )
+        }
+        return CommandResult(exitStatus: process.terminationStatus, output: outputBuffer.value())
     }
 }
 
@@ -89,6 +136,7 @@ final class DiskScanner: @unchecked Sendable {
         let listResult = try runChecked(
             executable: "/usr/sbin/diskutil",
             arguments: ["list", "-plist", "external", "physical"],
+            timeoutSeconds: 15,
             onCommand: onCommand
         )
         let listCommand = renderedCommand(
@@ -102,8 +150,16 @@ final class DiskScanner: @unchecked Sendable {
         )
 
         var disks: [ExternalDisk] = []
+        var notices: [String] = []
         for entry in diskList.disks {
             let wholeInfo = try diskInfo(identifier: entry.identifier, onCommand: onCommand)
+            if isVirtualUnlockerDisk(wholeInfo) {
+                let name = nonEmpty(wholeInfo.registryName) ?? nonEmpty(wholeInfo.mediaName) ?? entry.identifier
+                notices.append(
+                    "Detected \(name), which is the vendor unlock helper rather than the data volume. Complete the unlock, then wait for automatic refresh or press Refresh."
+                )
+                continue
+            }
             var volumes: [ExternalVolume] = []
 
             if entry.partitions.isEmpty, wholeInfo.filesystemType != nil {
@@ -153,7 +209,10 @@ final class DiskScanner: @unchecked Sendable {
                 )
             )
         }
-        return DiskSnapshot(disks: disks.sorted { $0.identifier < $1.identifier })
+        return DiskSnapshot(
+            disks: disks.sorted { $0.identifier < $1.identifier },
+            notices: notices
+        )
     }
 
     func diskInfo(identifier: String, onCommand: @escaping (String) -> Void) throws -> DiskInfoPropertyList {
@@ -161,6 +220,7 @@ final class DiskScanner: @unchecked Sendable {
         let result = try runChecked(
             executable: "/usr/sbin/diskutil",
             arguments: arguments,
+            timeoutSeconds: 15,
             onCommand: onCommand
         )
         return try decodePropertyList(
@@ -179,6 +239,7 @@ final class DiskScanner: @unchecked Sendable {
         let result = try runChecked(
             executable: "/usr/sbin/diskutil",
             arguments: arguments,
+            timeoutSeconds: 15,
             onCommand: onCommand
         )
         let plist = try decodePropertyList(
@@ -230,11 +291,16 @@ final class DiskScanner: @unchecked Sendable {
     private func runChecked(
         executable: String,
         arguments: [String],
+        timeoutSeconds: TimeInterval,
         onCommand: @escaping (String) -> Void
     ) throws -> CommandResult {
         let command = renderedCommand(executable: executable, arguments: arguments)
         onCommand(command)
-        let result = try runner.run(executable: executable, arguments: arguments) { _ in }
+        let result = try runner.run(
+            executable: executable,
+            arguments: arguments,
+            timeoutSeconds: timeoutSeconds
+        ) { _ in }
         guard result.exitStatus == 0 else {
             throw TroubleshooterError.commandFailed(
                 command: command,

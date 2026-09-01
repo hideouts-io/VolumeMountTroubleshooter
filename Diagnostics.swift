@@ -29,6 +29,7 @@ struct ExternalDisk: Hashable, Sendable {
 
 struct DiskSnapshot: Sendable {
     let disks: [ExternalDisk]
+    let notices: [String]
 
     var volumes: [ExternalVolume] {
         disks.flatMap(\.volumes).sorted {
@@ -48,6 +49,7 @@ enum TroubleshooterError: LocalizedError {
     case cancelled
     case commandLaunchFailed(executable: String, reason: String)
     case commandFailed(command: String, exitStatus: Int32, output: String)
+    case commandTimedOut(command: String, timeoutSeconds: TimeInterval)
     case invalidPropertyList(command: String, reason: String)
 
     var errorDescription: String? {
@@ -59,6 +61,8 @@ enum TroubleshooterError: LocalizedError {
         case let .commandFailed(command, exitStatus, output):
             let detail = output.trimmingCharacters(in: .whitespacesAndNewlines)
             return "Command failed with exit status \(exitStatus): \(command)\n\(detail)"
+        case let .commandTimedOut(command, timeoutSeconds):
+            return "Command timed out after \(Int(timeoutSeconds)) seconds: \(command). The storage device may still be changing state; wait for the automatic rescan or press Refresh."
         case let .invalidPropertyList(command, reason):
             return "Could not decode structured output from \(command): \(reason)"
         }
@@ -115,6 +119,7 @@ struct DiskInfoPropertyList: Decodable {
     let smartStatus: String?
     let size: Int64?
     let totalSize: Int64?
+    let content: String?
     let apfsContainerReference: String?
     let encryption: Bool?
     let fileVault: Bool?
@@ -134,6 +139,7 @@ struct DiskInfoPropertyList: Decodable {
         case smartStatus = "SMARTStatus"
         case size = "Size"
         case totalSize = "TotalSize"
+        case content = "Content"
         case apfsContainerReference = "APFSContainerReference"
         case encryption = "Encryption"
         case fileVault = "FileVault"
@@ -224,6 +230,14 @@ func nonEmpty(_ value: String?) -> String? {
 func isUserFacingAPFSVolume(_ volume: APFSVolumeRecord) -> Bool {
     let hiddenRoles: Set<String> = ["Preboot", "Recovery", "VM", "Update", "xART", "Hardware"]
     return hiddenRoles.isDisjoint(with: volume.roles)
+}
+
+func isVirtualUnlockerDisk(_ info: DiskInfoPropertyList) -> Bool {
+    let content = info.content?.lowercased() ?? ""
+    let names = [info.mediaName, info.registryName]
+        .compactMap { $0?.lowercased() }
+        .joined(separator: " ")
+    return content == "cd_partition_scheme" && names.contains("virtual cd")
 }
 
 func formattedByteCount(_ byteCount: Int64) -> String {
@@ -332,6 +346,42 @@ func runSelfTests() -> Bool {
     """
     let decoded = try? decodePropertyList(DiskListPropertyList.self, output: diskListXML, command: "self-test")
     guard decoded?.disks.first?.identifier == "disk4" else {
+        return false
+    }
+
+    let unlockerInfoXML = """
+    <?xml version="1.0" encoding="UTF-8"?>
+    <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+    <plist version="1.0"><dict>
+    <key>DeviceIdentifier</key><string>disk3</string>
+    <key>Content</key><string>CD_partition_scheme</string>
+    <key>MediaName</key><string>Virtual CD 55AE</string>
+    </dict></plist>
+    """
+    guard
+        let unlockerInfo = try? decodePropertyList(
+            DiskInfoPropertyList.self,
+            output: unlockerInfoXML,
+            command: "self-test"
+        ),
+        isVirtualUnlockerDisk(unlockerInfo)
+    else {
+        return false
+    }
+
+    let timeoutRunner = CommandRunner()
+    do {
+        _ = try timeoutRunner.run(
+            executable: "/bin/sleep",
+            arguments: ["1"],
+            timeoutSeconds: 0.05
+        ) { _ in }
+        return false
+    } catch let error as TroubleshooterError {
+        guard case .commandTimedOut = error else {
+            return false
+        }
+    } catch {
         return false
     }
 

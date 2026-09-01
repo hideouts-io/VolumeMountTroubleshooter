@@ -23,7 +23,8 @@ struct VolumeMountTroubleshooterApplication {
                 }
                 let ioreg = try runner.run(
                     executable: "/usr/sbin/ioreg",
-                    arguments: ["-p", "IOUSB", "-l", "-w0"]
+                    arguments: ["-p", "IOUSB", "-l", "-w0"],
+                    timeoutSeconds: 15
                 ) { _ in }
                 for disk in snapshot.disks {
                     print("DISK \(disk.identifier) | \(disk.name) | \(disk.busProtocol) | SMART \(disk.smartStatus)")

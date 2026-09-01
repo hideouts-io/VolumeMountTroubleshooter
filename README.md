@@ -283,6 +283,8 @@ Disk identifiers are rediscovered on every refresh. The app does not assume iden
 
 The app registers a native Disk Arbitration appeared callback. When macOS publishes a disk object, the callback schedules a fresh typed inventory after a short debounce interval.
 
+If a second disk event arrives while an inventory is already running, the app retains it and performs one follow-up refresh. Storage inventory commands time out after 15 seconds so a vendor unlock transition cannot leave the selector waiting indefinitely.
+
 Automatic detection refreshes the selector. It never automatically mounts, unmounts, unlocks, repairs, or ejects a device.
 
 ---
@@ -328,6 +330,8 @@ The scanner reads APFS and `diskutil` encryption metadata, including:
 - the current mount point.
 
 If the selected volume is encrypted and locked, the app stops before mounting and directs the user to Finder or Disk Utility. It does not invoke `diskutil apfs unlockVolume`, display a custom password field, read standard input, inspect the keychain, or store credentials.
+
+Some hardware-encrypted external drives first expose a small read-only virtual CD containing a vendor unlocker. The app excludes that helper media from the volume selector, explains that it is not the data volume, and waits for Disk Arbitration to publish the full-size unlocked disk. Once the real filesystem appears, the existing normal or read-only selected-volume mount workflow applies.
 
 An encrypted and unlocked volume may be mounted normally or read-only like any other selected volume.
 
@@ -548,6 +552,7 @@ VolumeMountTroubleshooter/
 ├── main.swift              # Application entry point and test modes
 ├── Info.plist              # macOS bundle metadata
 ├── build.sh                # Build, self-test, signing, and verification
+├── script/build_and_run.sh # Build and launch entrypoint for local debugging
 ├── README.md               # Project documentation
 └── .gitignore              # Excludes generated build output
 ```
@@ -593,6 +598,10 @@ Run the same layers manually:
 ### The volume is locked
 
 Unlock it through Finder or Disk Utility, then press **Refresh**. Do not send a password or recovery key to this application or include one in a report.
+
+### A SanDisk or Western Digital unlocker volume appears
+
+The small read-only unlocker is a virtual CD, not the data filesystem. Complete the vendor unlock, wait for the automatic follow-up refresh, and select the full-size volume when it appears. If the selector is still waiting after the drive settles, press **Refresh**; the app will never submit or collect the vendor password.
 
 ### Read-only remount fails with `Resource busy`
 

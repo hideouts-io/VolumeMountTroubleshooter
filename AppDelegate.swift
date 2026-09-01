@@ -8,7 +8,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let scanRunner = CommandRunner()
     private var diskMonitor: DiskArrivalMonitor?
     private var refreshWorkItem: DispatchWorkItem?
-    private var snapshot = DiskSnapshot(disks: [])
+    private var snapshot = DiskSnapshot(disks: [], notices: [])
     private var window: NSWindow?
     private var textView: NSTextView?
     private var statusLabel: NSTextField?
@@ -26,6 +26,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var completeLog = ""
     private var isRunning = false
     private var isRefreshing = false
+    private var automaticRefreshPending = false
     private var postRefreshStatus: (message: String, color: NSColor)?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -231,6 +232,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func scheduleAutomaticRefresh() {
+        if isRunning || isRefreshing {
+            automaticRefreshPending = true
+            return
+        }
         refreshWorkItem?.cancel()
         let workItem = DispatchWorkItem { [weak self] in
             self?.refreshVolumes(automatic: true)
@@ -244,8 +249,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func refreshVolumes(automatic: Bool) {
-        guard !isRunning, !isRefreshing else {
+        guard !isRunning else {
+            if automatic {
+                automaticRefreshPending = true
+            }
             return
+        }
+        guard !isRefreshing else {
+            if automatic {
+                automaticRefreshPending = true
+            }
+            return
+        }
+        if automatic {
+            automaticRefreshPending = false
         }
         isRefreshing = true
         refreshButton?.isEnabled = false
@@ -272,6 +289,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     self?.refreshButton?.isEnabled = true
                     self?.setStatus("Volume scan failed: \(error.localizedDescription)", color: .systemRed)
                     self?.appendLog("SCAN FAILURE: \(error.localizedDescription)\n")
+                    self?.runPendingAutomaticRefreshIfNeeded()
                 }
             }
         }
@@ -317,6 +335,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 appendLog("AUTO-DETECT: removed volume device(s): \(removed.joined(separator: ", "))\n")
             }
         }
+        runPendingAutomaticRefreshIfNeeded()
+    }
+
+    private func runPendingAutomaticRefreshIfNeeded() {
+        guard automaticRefreshPending, !isRunning, !isRefreshing else {
+            return
+        }
+        automaticRefreshPending = false
+        appendLog("AUTO-DETECT: storage changed during the previous scan; running a follow-up refresh.\n")
+        scheduleAutomaticRefresh()
     }
 
     @objc private func volumeSelectionChanged() {
@@ -326,8 +354,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func updateSelectionDetails() {
         guard let volume = selectedVolume(), let disk = snapshot.disk(containing: volume) else {
-            volumeDetailLabel?.stringValue = "No user-facing external volume detected."
-            setStatus("Attach an external volume, then press Refresh", color: .systemOrange)
+            if let notice = snapshot.notices.first {
+                volumeDetailLabel?.stringValue = notice
+                setStatus("Unlock helper detected — waiting for the data volume", color: .systemOrange)
+            } else {
+                volumeDetailLabel?.stringValue = "No user-facing external volume detected."
+                setStatus("Attach an external volume, then press Refresh", color: .systemOrange)
+            }
             return
         }
 
@@ -640,7 +673,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     ) throws -> CommandResult {
         let command = renderedCommand(executable: executable, arguments: arguments)
         postLog("$ \(command)\n")
-        let result = try runner.run(executable: executable, arguments: arguments) { [weak self] chunk in
+        let result = try runner.run(
+            executable: executable,
+            arguments: arguments,
+            timeoutSeconds: 30
+        ) { [weak self] chunk in
             self?.postLog(chunk)
         }
         if !result.output.hasSuffix("\n") {
@@ -658,7 +695,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     ) throws -> CommandResult {
         let command = renderedCommand(executable: executable, arguments: arguments)
         postLog("$ \(command)\n")
-        let result = try runner.run(executable: executable, arguments: arguments) { _ in }
+        let result = try runner.run(
+            executable: executable,
+            arguments: arguments,
+            timeoutSeconds: 30
+        ) { _ in }
         postLog("[\(reason)]\n")
         postLog("[exit status: \(result.exitStatus)]\n\n")
         return result
