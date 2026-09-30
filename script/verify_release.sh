@@ -44,7 +44,8 @@ if [[ ! -d "$app_path" ]]; then
     exit 1
 fi
 
-/usr/bin/xcrun lipo "$binary_path" -verify_arch arm64 x86_64
+/usr/bin/xcrun lipo "$binary_path" -verify_arch arm64
+/usr/bin/xcrun lipo "$binary_path" -verify_arch x86_64
 /usr/bin/codesign --verify --deep --strict --verbose=2 "$app_path"
 "$binary_path" --self-test
 

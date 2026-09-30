@@ -75,7 +75,7 @@ The app uses only Apple frameworks and fixed Apple command-line tools for its re
 
 ### Main window
 
-![Volume Mount Troubleshooter main window with a selected APFS volume](docs/images/volume-mount-troubleshooter-main.png)
+![Volume Mount Troubleshooter main window with the application logo](docs/images/volume-mount-troubleshooter-main.png)
 
 The main window keeps selection, explicit actions, privacy controls, current status, and the live command console in one view.
 

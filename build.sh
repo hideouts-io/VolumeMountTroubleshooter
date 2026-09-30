@@ -50,7 +50,8 @@ compile_slice "x86_64" "$x86_64_binary"
   "$arm64_binary" \
   "$x86_64_binary" \
   -output "$binary_path"
-/usr/bin/xcrun lipo "$binary_path" -verify_arch arm64 x86_64
+/usr/bin/xcrun lipo "$binary_path" -verify_arch arm64
+/usr/bin/xcrun lipo "$binary_path" -verify_arch x86_64
 /bin/rm -rf "$slice_dir"
 /bin/rm -rf "$build_dir/module-cache-arm64" "$build_dir/module-cache-x86_64"
 

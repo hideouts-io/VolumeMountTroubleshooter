@@ -101,6 +101,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             wrappingLabelWithString: "Select one external volume, then choose Inspect, Mount Read-Only, Mount Normally, Unmount Volume, or Safe Eject Disk. No erase, format, repair, or credential collection."
         )
         subtitleLabel.textColor = .secondaryLabelColor
+        subtitleLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+        let logoImageView = NSImageView()
+        logoImageView.image = NSApp.applicationIconImage
+        logoImageView.imageAlignment = .alignCenter
+        logoImageView.imageScaling = .scaleProportionallyUpOrDown
+        logoImageView.setAccessibilityLabel("Volume Mount Troubleshooter logo")
+        logoImageView.setContentHuggingPriority(.required, for: .horizontal)
+        logoImageView.setContentCompressionResistancePriority(.required, for: .horizontal)
+
+        let titleStack = NSStackView(views: [titleLabel, subtitleLabel])
+        titleStack.orientation = .vertical
+        titleStack.alignment = .leading
+        titleStack.spacing = 4
+        titleStack.setContentHuggingPriority(.defaultLow, for: .horizontal)
+
+        let headerStack = NSStackView(views: [logoImageView, titleStack])
+        headerStack.orientation = .horizontal
+        headerStack.alignment = .centerY
+        headerStack.spacing = 14
 
         let selectorLabel = NSTextField(labelWithString: "External volume:")
         selectorLabel.font = NSFont.systemFont(ofSize: 13, weight: .medium)
@@ -274,8 +294,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         self.textView = textView
 
         let contentStack = NSStackView(views: [
-            titleLabel,
-            subtitleLabel,
+            headerStack,
             selectorStack,
             volumeDetailLabel,
             smartDetailLabel,
@@ -294,6 +313,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         rootView.addSubview(contentStack)
 
         [
+            logoImageView,
+            titleStack,
+            headerStack,
             titleLabel,
             subtitleLabel,
             selectorStack,
@@ -315,8 +337,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             contentStack.leadingAnchor.constraint(equalTo: rootView.leadingAnchor, constant: 20),
             contentStack.trailingAnchor.constraint(equalTo: rootView.trailingAnchor, constant: -20),
             contentStack.bottomAnchor.constraint(equalTo: rootView.bottomAnchor, constant: -20),
-            titleLabel.widthAnchor.constraint(equalTo: contentStack.widthAnchor),
-            subtitleLabel.widthAnchor.constraint(equalTo: contentStack.widthAnchor),
+            logoImageView.widthAnchor.constraint(equalToConstant: 72),
+            logoImageView.heightAnchor.constraint(equalToConstant: 72),
+            headerStack.widthAnchor.constraint(equalTo: contentStack.widthAnchor),
+            titleLabel.widthAnchor.constraint(equalTo: titleStack.widthAnchor),
+            subtitleLabel.widthAnchor.constraint(equalTo: titleStack.widthAnchor),
             selectorStack.widthAnchor.constraint(equalTo: contentStack.widthAnchor),
             volumeDetailLabel.widthAnchor.constraint(equalTo: contentStack.widthAnchor),
             smartDetailLabel.widthAnchor.constraint(equalTo: contentStack.widthAnchor),
