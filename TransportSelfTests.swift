@@ -52,7 +52,9 @@ func runTransportSelfTests() -> Bool {
         }
     }
     let unprovenPath = PhysicalTransportPath(diskIdentifier: "disk4", busProtocol: "USB", collectedAt: path.collectedAt, nodes: [endpoint, media], deviceTreePathVerified: false)
-    guard unprovenPath.storageUSBNode == nil else {
+    guard unprovenPath.storageUSBNode == nil,
+          negotiatedConnectionSpeedSummary(unprovenPath).contains("unavailable"),
+          !negotiatedConnectionSpeedSummary(unprovenPath).contains("480 Mb/s") else {
         return false
     }
     for identity in [PhysicalMediaIdentity.observed(registryEntryID: 99), .unavailable(reason: "native matching failed")] {
@@ -68,7 +70,13 @@ func runTransportSelfTests() -> Bool {
     }
     let report = physicalTransportReport(transport: .observed(path), selectedIdentifier: apfsVolume.identifier, physicalStoreIdentifiers: apfsVolume.physicalStoreIdentifiers, smartStatus: disk.smartStatus)
     let redacted = privacyRedactedReport(report, userName: "tester")
-    guard !redacted.contains("registryID=0x"), !redacted.contains("locationID=0x"), redacted.contains("VID=0x1234") else {
+    guard
+        ["registryID", "locationID", "IOUSBHostDevice", "IOUSBHostInterface", "IOMedia", "[REDACTED]"].allSatisfy({ !report.contains($0) }),
+        redacted.hasSuffix(report),
+        report.contains("Identical product name"),
+        report.contains("480 Mb/s"),
+        report.contains("USB Attached SCSI (UAS)")
+    else {
         return false
     }
     let runner = CommandRunner()

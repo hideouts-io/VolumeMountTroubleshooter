@@ -37,4 +37,13 @@ The feature answers: **How is this selected storage device physically connected 
    - No Intel-only bundled executable or required system helper was found. The optional SMART collector is not installed. Native Intel hardware and macOS 28 runtime behavior remain unverified locally.
    - Local package evidence: `build/native-launch-validation.b4n6Af/`; native process evidence: `build/macos28-native-app-sample.txt` (ignored by Git).
 
+8. [x] Make connection evidence readable without internal identifiers.
+   - [x] Replace registry/location IDs and driver-stack output with the observed physical path, negotiated speed and storage protocol.
+   - [x] Keep disk identity validation internal; retain concise, explicit coverage limits and evidence-bounded explanations.
+   - [x] Build, run native self-tests and type checks, and verify Inspect plus Save Report on attached storage.
+   - Passed: universal build, native self-tests, Swift type checking, strict signature verification, plist/shell checks and diff review.
+   - Passed: selected SSD transport collection, native display, Inspect and Save Report. The saved connection section contains 13 nonempty lines instead of 48, preserving the path, 10.0 Gb/s negotiated speed, UAS protocol, verified disk match and coverage limits without internal IDs, driver classes or redaction placeholders.
+   - Runtime caveat: the existing 15-second diskutil timeouts recurred during initial discovery. The command-line scan retained the SSD with an isolated unlocker-disk failure; the subsequent native GUI discovery and selected SSD inspection/export completed. The timeout cause remains unresolved. Hub/dock and non-USB report paths remain unverified on physical hardware.
+   - Local evidence: `build/readable-transport-build.log`, `build/readable-transport-scan.txt` and `build/readable-transport-gui-report-20261006-2230.txt` (ignored by Git).
+
 Out of scope: phone charging/battery/diagnostics, accessory monitoring, general USB inventory, display diagnostics, power dashboards, inferred cable faults, state-changing hardware tests and remote publication.

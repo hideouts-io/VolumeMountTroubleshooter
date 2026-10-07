@@ -115,7 +115,45 @@ func usbDescriptorRevision(_ version: UInt16) -> String? {
 }
 
 func transportNodeLabel(_ node: TransportNode) -> String {
-    node.usb?.productName ?? node.className
+    switch node.role {
+    case .controller:
+        return "USB controller"
+    case .port:
+        return "USB port"
+    case .thunderbolt:
+        return "Thunderbolt connection"
+    case .hub, .usbDevice:
+        guard let product = node.usb?.productName else {
+            return node.role == .hub ? "USB hub (name unavailable)" : "USB device (name unavailable)"
+        }
+        let name: String
+        if let vendor = node.usb?.vendorName, !product.localizedCaseInsensitiveContains(vendor) {
+            name = "\(vendor) \(product)"
+        } else {
+            name = product
+        }
+        return node.role == .hub ? "USB hub (\(name))" : name
+    case .storageInterface, .storageDriver, .media, .other:
+        return node.role.rawValue
+    }
+}
+
+/// Driver and platform services establish ancestry internally but are not physical connection steps.
+func physicalConnectionPath(_ path: PhysicalTransportPath) -> String {
+    let visibleNodes = path.nodes.filter {
+        [.controller, .port, .hub, .usbDevice, .thunderbolt].contains($0.role)
+    }
+    return (["Mac"] + visibleNodes.map(transportNodeLabel) + ["/dev/\(path.diskIdentifier)"]).joined(separator: " → ")
+}
+
+func negotiatedConnectionSpeedSummary(_ path: PhysicalTransportPath) -> String {
+    if let rate = path.storageUSBNode?.usb?.negotiatedBitsPerSecond {
+        return "Negotiated USB speed: \(formattedLinkSpeed(rate)) (link rate, not measured storage throughput)"
+    }
+    if path.nodes.contains(where: { $0.usb != nil }) || path.busProtocol.caseInsensitiveCompare("USB") == .orderedSame {
+        return "Negotiated USB speed: unavailable — macOS did not report a rate for the storage device."
+    }
+    return "Connection speed: unavailable — only USB link rates are supported."
 }
 
 func physicalConnectionSummary(_ transport: PhysicalTransport) -> String {
@@ -123,12 +161,7 @@ func physicalConnectionSummary(_ transport: PhysicalTransport) -> String {
     case let .unavailable(reason):
         return "Physical connection unavailable: \(reason)"
     case let .observed(path):
-        let visibleNodes = path.nodes.filter {
-            [.controller, .port, .hub, .usbDevice, .thunderbolt].contains($0.role)
-        }
-        let chain = (["Mac"] + visibleNodes.map(transportNodeLabel) + ["/dev/\(path.diskIdentifier)"]).joined(separator: " → ")
-        let speed = path.storageUSBNode?.usb?.negotiatedBitsPerSecond.map(formattedLinkSpeed) ?? "unavailable"
-        return "Physical connection: \(chain)\nSelected storage USB link: \(speed). Use Inspect for evidence and transport coverage."
+        return "Physical connection: \(physicalConnectionPath(path))\n\(negotiatedConnectionSpeedSummary(path))"
     }
 }
 
@@ -142,52 +175,40 @@ func physicalTransportReport(
     var lines = [
         "=== PHYSICAL CONNECTION ===",
         "Selected storage: /dev/\(selectedIdentifier)",
-        "Physical-store evidence: \(physicalStoreIdentifiers.joined(separator: ", "))"
+        "Backing storage: \(physicalStoreIdentifiers.isEmpty ? "unresolved" : physicalStoreIdentifiers.map { "/dev/\($0)" }.joined(separator: ", "))"
     ]
     switch transport {
     case let .unavailable(reason):
         lines += [
-            "Correlation: unresolved",
-            "Transport coverage: unavailable — \(reason)",
-            "No device association or connection cause was inferred."
+            "Physical connection unavailable: \(reason)",
+            "Coverage: no verified physical connection is available; no connection cause was inferred."
         ]
     case let .observed(path):
         lines += [
             "Collected: \(ISO8601DateFormatter().string(from: path.collectedAt))",
-            "BSD disk: /dev/\(path.diskIdentifier) (current identifier, not a persistent identity)",
-            "diskutil bus protocol: \(path.busProtocol)",
-            "Correlation: exact current IOMedia BSD Name and Whole=true; unique IOService parent ancestry",
-            "diskutil DeviceTreePath witness: \(path.deviceTreePathVerified ? "verified in the same ancestry" : "unavailable")",
-            "Physical path (Mac → block media):"
+            "Connection type: \(path.busProtocol)",
+            "Physical path: \(physicalConnectionPath(path))",
+            negotiatedConnectionSpeedSummary(path)
         ]
-        if let endpoint = path.storageUSBNode {
-            lines.insert("USB storage device/bridge: \(transportNodeLabel(endpoint)) (enumerated identity; internal chipset unverified)", at: lines.count - 1)
-        }
-        for node in path.nodes {
-            lines.append("  \(node.role.rawValue): \(transportNodeLabel(node)) [\(node.className), registryID=0x\(String(node.registryEntryID, radix: 16))]")
-            if let usb = node.usb {
-                let vendor = usb.vendorID.map { String(format: "0x%04x", $0) } ?? "unavailable"
-                let product = usb.productID.map { String(format: "0x%04x", $0) } ?? "unavailable"
-                let location = usb.locationID.map { String(format: "0x%08x", $0) } ?? "unavailable"
-                lines.append("    USB identity: vendor=\(usb.vendorName ?? "unavailable"), VID=\(vendor), PID=\(product), locationID=\(location)")
-                lines.append("    Negotiated link (UsbLinkSpeed): \(usb.negotiatedBitsPerSecond.map(formattedLinkSpeed) ?? "unavailable")")
-                let revision = usb.descriptorVersion.flatMap(usbDescriptorRevision) ?? "unavailable"
-                lines.append("    Device descriptor bcdUSB: \(revision) (protocol revision; does not establish maximum speed)")
-                if usb.tunneledThroughUSB4 == true {
-                    lines.append("    UsbTunnel: true — USB4 tunnel reported; dock identity and tunnel rate are not established")
-                }
+        if path.storageUSBNode != nil {
+            let protocolLabel: String
+            switch path.nodes.last(where: { $0.role == .storageInterface })?.storageInterfaceProtocol {
+            case 0x50: protocolLabel = "USB Bulk-Only Transport"
+            case 0x62: protocolLabel = "USB Attached SCSI (UAS)"
+            case let code?: protocolLabel = String(format: "unrecognized USB interface protocol 0x%02x", code)
+            case nil: protocolLabel = "unavailable — macOS did not report the USB storage protocol"
             }
-            if node.role == .storageInterface {
-                let protocolLabel: String
-                switch node.storageInterfaceProtocol {
-                case 0x50: protocolLabel = "Bulk-Only Transport (0x50)"
-                case 0x62: protocolLabel = "USB Attached SCSI (0x62)"
-                case let code?: protocolLabel = String(format: "reported interface protocol 0x%02x", code)
-                case nil: protocolLabel = "interface protocol unavailable"
-                }
-                lines.append("    bInterfaceClass=0x08; \(protocolLabel)")
-            }
+            lines.append("Storage protocol: \(protocolLabel)")
         }
+        for hub in path.nodes.filter({ $0.role == .hub }) {
+            let speed = hub.usb?.negotiatedBitsPerSecond.map(formattedLinkSpeed) ?? "unavailable"
+            lines.append("Hub link — \(transportNodeLabel(hub)): \(speed)")
+        }
+        if path.nodes.contains(where: { $0.usb?.tunneledThroughUSB4 == true }) {
+            lines.append("USB4 tunnel: reported on this path; tunnel speed and dock identity are unavailable.")
+        }
+        let additionalMatch = path.deviceTreePathVerified ? "; diskutil's physical path agrees" : ""
+        lines.append("Disk match: current macOS storage identity and ancestry verified\(additionalMatch). Disk numbers can change after reconnection.")
         lines += transportCoverage(path)
         lines += transportExplanations(path: path, smartStatus: smartStatus)
     }
@@ -196,39 +217,42 @@ func physicalTransportReport(
 
 func transportCoverage(_ path: PhysicalTransportPath) -> [String] {
     let hubCount = path.nodes.filter { $0.role == .hub }.count
-    let controllerPresent = path.nodes.contains { $0.role == .controller }
-    let usbPresent = path.nodes.contains { $0.usb != nil }
-    let endpoint = path.storageUSBNode
-    return [
-        "TRANSPORT COVERAGE",
-        "  IOMedia / BSD correlation: reported",
-        "  IOService ancestry: reported (\(path.nodes.count) nodes)",
-        "  USB host controller: \(controllerPresent ? "reported" : "unavailable in this ancestry")",
-        "  USB hubs: \(usbPresent ? "\(hubCount) observed ancestor(s); an unenumerated dock or adapter cannot be excluded" : "unsupported for this non-USB path")",
-        "  USB storage device/bridge identity: \(endpoint != nil ? "reported from the device above the mass-storage interface" : "unavailable; no proven USB mass-storage endpoint in this ancestry")",
-        "  Internal bridge chipset / SATA or NVMe mapping: unavailable; VID/PID and product strings do not prove chip identity",
-        "  Selected endpoint negotiated rate: \(endpoint?.usb?.negotiatedBitsPerSecond != nil ? "reported by UsbLinkSpeed" : (usbPresent ? "unavailable; UsbLinkSpeed absent at the storage endpoint" : "unsupported for this non-USB path"))",
-        "  Advertised maximum rate: unavailable; descriptor revision is not a speed claim",
-        "  Thunderbolt / USB4 link-rate enrichment: unsupported; any observed services remain in the path",
-        "  Chassis port label, cable capability and available power: unavailable",
-        "  USB property stability: UsbLinkSpeed, UsbTunnel and locationID availability varies by macOS and hardware"
+    let usbPresent = path.nodes.contains { $0.usb != nil } || path.busProtocol.caseInsensitiveCompare("USB") == .orderedSame
+    var lines: [String] = []
+    if usbPresent {
+        lines.append(hubCount == 0
+            ? "USB hubs: none reported on this path; unreported docks or adapters remain unknown."
+            : "USB hubs: \(hubCount) reported on this path.")
+        if !path.nodes.contains(where: { $0.role == .controller }) {
+            lines.append("Coverage: the USB controller was not identified in this path.")
+        }
+        if path.storageUSBNode == nil {
+            lines.append("Coverage: the USB storage device/bridge was not identified; its speed and storage protocol are unavailable.")
+        }
+    } else {
+        lines.append("Coverage: USB device details are unsupported for this non-USB path.")
+    }
+    if !path.deviceTreePathVerified {
+        lines.append("Coverage: the additional macOS physical-path check is unavailable.")
+    }
+    lines += [
+        "Unavailable: advertised maximum speed, internal bridge chipset, chassis port label, cable capability and available power.",
+        "Unsupported: Thunderbolt/USB4 link speeds."
     ]
+    return lines
 }
 
 func transportExplanations(path: PhysicalTransportPath, smartStatus: String) -> [String] {
-    var lines = ["BOUNDED TRANSPORT EXPLANATIONS"]
-    if let rate = path.storageUSBNode?.usb?.negotiatedBitsPerSecond {
-        lines.append("  The selected endpoint reports \(formattedLinkSpeed(rate)) signaling, not measured storage throughput.")
-        if rate <= 480_000_000 {
-            lines.append("  This low signaling rate can constrain transfers. Port, hub, adapter, device or cable negotiation could contribute; these observations do not identify which component is responsible.")
-        }
+    var lines: [String] = []
+    if let rate = path.storageUSBNode?.usb?.negotiatedBitsPerSecond, rate <= 480_000_000 {
+        lines.append("Possible effect: the \(formattedLinkSpeed(rate)) USB link can limit transfers; the limiting component has not been identified.")
     }
     if path.nodes.contains(where: { $0.role == .hub }) {
-        lines.append("  An intermediate USB hub is observed. Concurrent traffic could share upstream bandwidth; competing traffic and a resulting bottleneck were not measured.")
+        lines.append("Possible effect: devices on the reported USB hub may share bandwidth; competing traffic was not measured.")
     }
     if path.storageUSBNode != nil, smartStatus.lowercased().contains("not supported") {
-        lines.append("  diskutil reports SMART Not Supported on this USB path. Passthrough may be unavailable, but neither bridge behavior nor drive health is established.")
+        lines.append("Health limitation: SMART is not supported on this USB path. Limited passthrough is possible; a drive fault is not established.")
     }
-    lines.append("  This topology does not establish the cause of a mount failure or disconnect, cable quality, available power, bridge reliability or drive health.")
+    lines.append("Interpretation: these connection observations do not establish the cause of a mount failure or disconnect, or prove bridge reliability.")
     return lines
 }

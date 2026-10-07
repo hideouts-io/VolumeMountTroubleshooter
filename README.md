@@ -102,7 +102,7 @@ Volume Mount Troubleshooter currently provides:
 - Finder-only reveal for mounted vendor unlocker volumes without launching their applications;
 - SMART status plus optional temperature, media-error, unsafe-shutdown, power-on-hour, and percentage-used reporting;
 - selected-storage controller, hub, USB device/bridge and IOMedia ancestry with exact current BSD correlation;
-- negotiated USB link-rate observations, separate descriptor revisions and explicit transport coverage;
+- negotiated USB link-rate observations and explicit transport coverage;
 - recent `diskarbitrationd` error and fault collection;
 - native Disk Arbitration notification handling for attached and disconnected devices, including immediate stale-selector removal;
 - exact post-mount verification of mount point and writable state;
@@ -368,11 +368,11 @@ An encrypted and unlocked volume may be mounted normally or read-only like any o
 
 ### Selected physical connection
 
-The connection display traces the selected storage device from its current whole-disk `IOMedia` BSD name upward through the IOService registry. Reports retain observed controller, port, hub, storage interface, USB endpoint and block-media ancestry. Product names never establish disk identity. `diskutil` remains authoritative for storage inventory; APFS physical-store records associate synthesized volumes with physical disks. Multiple physical stores or registry parents produce explicit unresolved coverage rather than a guessed single connection.
+The connection display traces the selected storage device from its current whole-disk `IOMedia` BSD name upward through the IOService registry. Reports show a readable controller, port, hub and storage-device path, negotiated speed, storage protocol and concise coverage limits. Internal registry/location IDs, driver classes and descriptor codes are omitted from both the display and reports. Product names never establish disk identity. `diskutil` remains authoritative for storage inventory; APFS physical-store records associate synthesized volumes with physical disks. Multiple physical stores or registry parents produce explicit unresolved coverage rather than a guessed single connection.
 
 Inspect revalidates the selected volume's backing store, device-tree ancestry and current media registry ID. Disk numbers and registry IDs are transient; a replaced media service requires refreshing and selecting the device again. Transport observations are also refreshed with the existing Disk Arbitration inventory flow.
 
-USB product and vendor descriptors and VID/PID identify the enumerated storage device/bridge. They do not establish the internal bridge chipset, SATA/NVMe mapping, cable capability, power availability or chassis port label. Coverage reports distinguish observed data, unavailable properties and unsupported Thunderbolt/USB4 link-rate enrichment. An unenumerated dock or adapter cannot be excluded merely because no USB hub node was observed.
+USB product and vendor names describe the enumerated storage device/bridge. They do not establish the internal bridge chipset, SATA/NVMe mapping, cable capability, power availability or chassis port label. Coverage reports distinguish observed data, unavailable properties and unsupported Thunderbolt/USB4 link-rate enrichment. An unenumerated dock or adapter cannot be excluded merely because no USB hub node was observed.
 
 ### SMART
 
@@ -527,7 +527,6 @@ Command-launch failures, malformed property lists, missing required fields, canc
 - the signed-in username within `/Users/...` paths;
 - USB and storage serial-number fields;
 - IOKit session identifiers;
-- transport registry-entry and USB location identifiers;
 - hardware UIDs;
 - disk and volume UUID fields; and
 - UUID-shaped values elsewhere in the report.
