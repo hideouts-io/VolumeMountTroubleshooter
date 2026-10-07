@@ -24,6 +24,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var volumePopup: NSPopUpButton?
     private var volumeDetailLabel: NSTextField?
     private var smartDetailLabel: NSTextField?
+    private var connectionPathLabel: NSTextField?
     private var unlockProgressLabel: NSTextField?
     private var redactCheckbox: NSButton?
     private var inspectButton: NSButton?
@@ -126,6 +127,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         selectorLabel.font = NSFont.systemFont(ofSize: 13, weight: .medium)
 
         let volumePopup = NSPopUpButton()
+        volumePopup.setAccessibilityIdentifier("volumeSelector")
         volumePopup.addItem(withTitle: "Scanning for external volumes…")
         volumePopup.isEnabled = false
         volumePopup.target = self
@@ -153,6 +155,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         smartDetailLabel.isHidden = true
         self.smartDetailLabel = smartDetailLabel
 
+        let connectionPathLabel = NSTextField(wrappingLabelWithString: "")
+        connectionPathLabel.textColor = .secondaryLabelColor
+        connectionPathLabel.font = NSFont.systemFont(ofSize: 12)
+        connectionPathLabel.isSelectable = true
+        connectionPathLabel.isHidden = true
+        connectionPathLabel.setAccessibilityIdentifier("connectionPath")
+        self.connectionPathLabel = connectionPathLabel
+
         let unlockProgressLabel = NSTextField(wrappingLabelWithString: "")
         unlockProgressLabel.font = NSFont.systemFont(ofSize: 12, weight: .medium)
         unlockProgressLabel.textColor = .systemOrange
@@ -160,6 +170,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         self.unlockProgressLabel = unlockProgressLabel
 
         let redactCheckbox = NSButton(checkboxWithTitle: "Redact shared reports", target: self, action: nil)
+        redactCheckbox.setAccessibilityIdentifier("redactSharedReports")
         redactCheckbox.state = .on
         self.redactCheckbox = redactCheckbox
 
@@ -179,6 +190,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         inspectButton.bezelStyle = .rounded
         inspectButton.keyEquivalent = "\r"
         inspectButton.identifier = NSUserInterfaceItemIdentifier("inspectButton")
+        inspectButton.setAccessibilityIdentifier("inspectButton")
         inspectButton.toolTip = "Collect read-only disk, volume, USB, SMART, encryption, and Disk Arbitration evidence."
         inspectButton.isEnabled = false
         self.inspectButton = inspectButton
@@ -241,11 +253,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         let copyButton = NSButton(title: "Copy Report", target: self, action: #selector(copyLog))
         copyButton.bezelStyle = .rounded
+        copyButton.setAccessibilityIdentifier("copyReportButton")
         copyButton.isEnabled = false
         self.copyButton = copyButton
 
         let saveButton = NSButton(title: "Save Report…", target: self, action: #selector(saveReport))
         saveButton.bezelStyle = .rounded
+        saveButton.setAccessibilityIdentifier("saveReportButton")
         saveButton.isEnabled = false
         self.saveButton = saveButton
 
@@ -282,6 +296,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         scrollView.borderType = .bezelBorder
 
         let textView = NSTextView()
+        textView.setAccessibilityIdentifier("diagnosticConsole")
         textView.isEditable = false
         textView.isSelectable = true
         textView.isRichText = false
@@ -298,6 +313,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             selectorStack,
             volumeDetailLabel,
             smartDetailLabel,
+            connectionPathLabel,
             unlockProgressLabel,
             optionStack,
             statusLabel,
@@ -321,6 +337,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             selectorStack,
             volumeDetailLabel,
             smartDetailLabel,
+            connectionPathLabel,
             unlockProgressLabel,
             optionStack,
             statusLabel,
@@ -345,6 +362,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             selectorStack.widthAnchor.constraint(equalTo: contentStack.widthAnchor),
             volumeDetailLabel.widthAnchor.constraint(equalTo: contentStack.widthAnchor),
             smartDetailLabel.widthAnchor.constraint(equalTo: contentStack.widthAnchor),
+            connectionPathLabel.widthAnchor.constraint(equalTo: contentStack.widthAnchor),
             unlockProgressLabel.widthAnchor.constraint(equalTo: contentStack.widthAnchor),
             optionStack.widthAnchor.constraint(equalTo: contentStack.widthAnchor),
             statusLabel.widthAnchor.constraint(equalTo: contentStack.widthAnchor),
@@ -769,6 +787,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard let volume = selectedVolume(), let disk = snapshot.disk(containing: volume) else {
             smartDetailLabel?.stringValue = ""
             smartDetailLabel?.isHidden = true
+            connectionPathLabel?.stringValue = ""
+            connectionPathLabel?.toolTip = nil
+            connectionPathLabel?.isHidden = true
             if let trackedUnlocker {
                 volumeDetailLabel?.stringValue = "Detected \(trackedUnlocker.name), which is the vendor unlock helper rather than the data volume. No application or credential prompt is opened automatically."
                 setStatus("Unlock helper detected — waiting for the data volume", color: .systemOrange)
@@ -789,6 +810,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         ].compactMap { $0 }
         smartDetailLabel?.stringValue = smartLines.joined(separator: "\n")
         smartDetailLabel?.isHidden = false
+        let transport = selectedPhysicalTransport(volume: volume, disk: disk)
+        connectionPathLabel?.stringValue = physicalConnectionSummary(transport)
+        connectionPathLabel?.toolTip = physicalTransportReport(
+            transport: transport,
+            selectedIdentifier: volume.identifier,
+            physicalStoreIdentifiers: volume.physicalStoreIdentifiers,
+            smartStatus: disk.smartStatus
+        )
+        connectionPathLabel?.isHidden = false
         setStatus("Ready — choose an explicit action for the selected volume", color: .labelColor)
     }
 
@@ -1202,13 +1232,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         disk: ExternalDisk,
         runner: CommandRunner
     ) throws {
-        let profiler = try runLogged(
-            executable: "/usr/sbin/system_profiler",
-            arguments: ["SPUSBDataType", "SPThunderboltDataType", "-detailLevel", "mini"],
-            runner: runner
+        let transport = try DiskScanner(runner: runner).currentPhysicalTransport(
+            volume: volume,
+            disk: disk,
+            onCommand: { command in self.postLog("$ \(command)\n") }
         )
-        if profiler.exitStatus != 0 {
-            postLog("WARNING: System Profiler failed; diskutil remains the authoritative storage inventory.\n\n")
+        postLog(physicalTransportReport(
+            transport: transport,
+            selectedIdentifier: volume.identifier,
+            physicalStoreIdentifiers: volume.physicalStoreIdentifiers,
+            smartStatus: disk.smartStatus
+        ))
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.selectedVolume()?.identifier == volume.identifier else {
+                return
+            }
+            self.connectionPathLabel?.stringValue = physicalConnectionSummary(transport)
+            self.connectionPathLabel?.toolTip = physicalTransportReport(
+                transport: transport,
+                selectedIdentifier: volume.identifier,
+                physicalStoreIdentifiers: volume.physicalStoreIdentifiers,
+                smartStatus: disk.smartStatus
+            )
         }
 
         let externalList = try runLogged(
@@ -1241,18 +1286,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             postLog("\(caveat)\n")
         }
         postLog("\n")
-
-        let ioreg = try runCaptured(
-            executable: "/usr/sbin/ioreg",
-            arguments: ["-p", "IOUSB", "-l", "-w0"],
-            reason: "raw output omitted because it can contain hardware serial identifiers",
-            runner: runner
-        )
-        if let speed = usbLinkSpeedBitsPerSecond(from: ioreg.output, productName: disk.name) {
-            postLog("USB CONNECTION SPEED: \(formattedLinkSpeed(speed)) for \(disk.name)\n\n")
-        } else {
-            postLog("USB CONNECTION SPEED: unavailable for \(disk.name); the device may use a path not exposed in the IOUSB plane.\n\n")
-        }
 
         let volumeInfo = try runLogged(
             executable: "/usr/sbin/diskutil",

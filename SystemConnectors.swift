@@ -207,7 +207,14 @@ final class DiskScanner: @unchecked Sendable {
         entry: DiskListEntry,
         onCommand: @escaping (String) -> Void
     ) throws -> ScannedExternalDisk {
+        let mediaIdentity = try collectMediaIdentity(identifier: entry.identifier)
         let wholeInfo = try diskInfo(identifier: entry.identifier, onCommand: onCommand)
+        guard wholeInfo.parentWholeDisk == entry.identifier else {
+            throw TroubleshooterError.invalidPropertyList(
+                command: "diskutil info -plist /dev/\(entry.identifier)",
+                reason: "the external physical inventory entry is not its own parent whole disk"
+            )
+        }
         if isVirtualUnlockerDisk(wholeInfo) {
             return .unlocker(
                 try virtualUnlocker(
@@ -226,6 +233,7 @@ final class DiskScanner: @unchecked Sendable {
                     wholeDiskIdentifier: entry.identifier,
                     fallbackName: entry.identifier,
                     fallbackSize: entry.size,
+                    physicalStoreIdentifiers: [entry.identifier],
                     apfsRecord: nil
                 )
             )
@@ -233,10 +241,17 @@ final class DiskScanner: @unchecked Sendable {
 
         for partition in entry.partitions {
             let partitionInfo = try diskInfo(identifier: partition.identifier, onCommand: onCommand)
+            guard partitionInfo.parentWholeDisk == entry.identifier else {
+                throw TroubleshooterError.invalidPropertyList(
+                    command: "diskutil info -plist /dev/\(partition.identifier)",
+                    reason: "the scanned partition belongs to a different physical disk"
+                )
+            }
             if let containerReference = nonEmpty(partitionInfo.apfsContainerReference) {
                 let apfsVolumes = try volumesInAPFSContainer(
                     containerReference: containerReference,
                     wholeDiskIdentifier: entry.identifier,
+                    physicalStoreIdentifier: partition.identifier,
                     onCommand: onCommand
                 )
                 volumes.append(contentsOf: apfsVolumes)
@@ -247,6 +262,7 @@ final class DiskScanner: @unchecked Sendable {
                         wholeDiskIdentifier: entry.identifier,
                         fallbackName: partition.identifier,
                         fallbackSize: partition.size,
+                        physicalStoreIdentifiers: [entry.identifier],
                         apfsRecord: nil
                     )
                 )
@@ -259,6 +275,21 @@ final class DiskScanner: @unchecked Sendable {
             identifier: entry.identifier,
             onCommand: onCommand
         )
+        let physicalTransport: PhysicalTransport
+        switch mediaIdentity {
+        case let .observed(expectedID):
+            physicalTransport = try collectPhysicalTransport(info: wholeInfo, onCommand: onCommand)
+            do {
+                try verifyMediaContinuity(identifier: entry.identifier, expectedRegistryEntryID: expectedID)
+            } catch let error as TransportScanError {
+                throw TroubleshooterError.invalidPropertyList(
+                    command: "IOKit identity revalidation for /dev/\(entry.identifier)",
+                    reason: error.localizedDescription
+                )
+            }
+        case let .unavailable(reason):
+            physicalTransport = .unavailable(reason: "Initial block-media identity unavailable. \(reason)")
+        }
         return .disk(
             ExternalDisk(
                 identifier: entry.identifier,
@@ -267,10 +298,94 @@ final class DiskScanner: @unchecked Sendable {
                 busProtocol: nonEmpty(wholeInfo.busProtocol) ?? "Unknown",
                 smartStatus: nonEmpty(wholeInfo.smartStatus) ?? "Unavailable",
                 expandedSMART: expandedSMART,
+                mediaIdentity: mediaIdentity,
+                physicalTransport: physicalTransport,
                 size: wholeInfo.totalSize ?? wholeInfo.size ?? entry.size,
                 volumes: uniqueVolumes.sorted { $0.identifier < $1.identifier }
             )
         )
+    }
+
+    private func collectMediaIdentity(identifier: String) throws -> PhysicalMediaIdentity {
+        do {
+            return .observed(registryEntryID: try TransportScanner(runner: runner).mediaRegistryEntryID(diskIdentifier: identifier))
+        } catch let error as TransportScanError {
+            return .unavailable(reason: error.localizedDescription)
+        }
+    }
+
+    private func verifyMediaContinuity(identifier: String, expectedRegistryEntryID: UInt64) throws {
+        let currentID = try TransportScanner(runner: runner).mediaRegistryEntryID(diskIdentifier: identifier)
+        guard currentID == expectedRegistryEntryID else {
+            throw TransportScanError.invalidObservation(reason: "the BSD disk number was reused by a different IOMedia service during collection; refresh and select again")
+        }
+    }
+
+    private func collectPhysicalTransport(
+        info: DiskInfoPropertyList,
+        onCommand: @escaping (String) -> Void
+    ) throws -> PhysicalTransport {
+        onCommand("IOKit: exact IOMedia BSD match and IOService ancestry for /dev/\(info.identifier)")
+        do {
+            let path = try TransportScanner(runner: runner).scan(
+                diskIdentifier: info.identifier,
+                busProtocol: nonEmpty(info.busProtocol) ?? "Unknown",
+                expectedDeviceTreePath: nonEmpty(info.deviceTreePath)
+            )
+            return .observed(path)
+        } catch let error as TransportScanError {
+            return .unavailable(reason: error.localizedDescription)
+        }
+    }
+
+    /// Revalidates the selected volume's backing store before publishing a fresh transport report.
+    func currentPhysicalTransport(
+        volume: ExternalVolume,
+        disk: ExternalDisk,
+        onCommand: @escaping (String) -> Void
+    ) throws -> PhysicalTransport {
+        guard case let .observed(expectedID) = disk.mediaIdentity else {
+            return .unavailable(reason: "No exact block-media identity was captured when this disk was selected. Refresh and select it again; continuity cannot be inferred from disk numbers or a shared port.")
+        }
+        do {
+            try verifyMediaContinuity(identifier: disk.identifier, expectedRegistryEntryID: expectedID)
+        } catch let error as TransportScanError {
+            return .unavailable(reason: error.localizedDescription)
+        }
+        let selectedInfo = try diskInfo(identifier: volume.identifier, onCommand: onCommand)
+        guard selectedInfo.identifier == volume.identifier else {
+            return .unavailable(reason: "diskutil returned a different selected volume. Refresh the storage inventory.")
+        }
+        let currentStores: [String]
+        if let reference = nonEmpty(selectedInfo.apfsContainerReference) {
+            let container = try apfsContainer(reference: reference, onCommand: onCommand)
+            guard container.volumes.contains(where: { $0.identifier == volume.identifier }) else {
+                return .unavailable(reason: "The selected APFS volume is absent from its current container. Refresh the storage inventory.")
+            }
+            currentStores = container.physicalStores.map(\.identifier)
+        } else if let whole = nonEmpty(selectedInfo.parentWholeDisk) {
+            currentStores = [whole]
+        } else {
+            return .unavailable(reason: "diskutil did not expose the selected volume's parent whole disk. No physical association was guessed.")
+        }
+        guard currentStores == volume.physicalStoreIdentifiers, currentStores.count == 1 else {
+            return .unavailable(reason: "The selected volume's physical-store mapping is changed or has multiple stores. Refresh; no single path was attributed to it.")
+        }
+        let storeInfo = try diskInfo(identifier: currentStores[0], onCommand: onCommand)
+        guard storeInfo.parentWholeDisk == disk.identifier else {
+            return .unavailable(reason: "The selected physical store no longer belongs to /dev/\(disk.identifier). Refresh the storage inventory.")
+        }
+        let wholeInfo = try diskInfo(identifier: disk.identifier, onCommand: onCommand)
+        guard wholeInfo.identifier == disk.identifier, wholeInfo.deviceTreePath == disk.deviceTreePath else {
+            return .unavailable(reason: "The selected physical disk's identity or DeviceTreePath changed. Refresh before inspecting its connection.")
+        }
+        let transport = try collectPhysicalTransport(info: wholeInfo, onCommand: onCommand)
+        do {
+            try verifyMediaContinuity(identifier: disk.identifier, expectedRegistryEntryID: expectedID)
+        } catch let error as TransportScanError {
+            return .unavailable(reason: error.localizedDescription)
+        }
+        return transport
     }
 
     private func collectExpandedSMART(
@@ -332,6 +447,9 @@ final class DiskScanner: @unchecked Sendable {
     }
 
     func diskInfo(identifier: String, onCommand: @escaping (String) -> Void) throws -> DiskInfoPropertyList {
+        guard wholeDiskIdentifier(forPhysicalStore: identifier) != nil else {
+            throw TroubleshooterError.invalidPropertyList(command: "diskutil info -plist", reason: "an invalid BSD disk or partition identifier was supplied")
+        }
         let arguments = ["info", "-plist", "/dev/\(identifier)"]
         let result = try runChecked(
             executable: "/usr/sbin/diskutil",
@@ -339,19 +457,54 @@ final class DiskScanner: @unchecked Sendable {
             timeoutSeconds: 15,
             onCommand: onCommand
         )
-        return try decodePropertyList(
+        let info = try decodePropertyList(
             DiskInfoPropertyList.self,
             output: result.output,
             command: renderedCommand(executable: "/usr/sbin/diskutil", arguments: arguments)
         )
+        guard info.identifier == identifier else {
+            throw TroubleshooterError.invalidPropertyList(
+                command: renderedCommand(executable: "/usr/sbin/diskutil", arguments: arguments),
+                reason: "the response's DeviceIdentifier does not match the requested BSD identifier"
+            )
+        }
+        return info
     }
 
     private func volumesInAPFSContainer(
         containerReference: String,
         wholeDiskIdentifier: String,
+        physicalStoreIdentifier: String,
         onCommand: @escaping (String) -> Void
     ) throws -> [ExternalVolume] {
-        let arguments = ["apfs", "list", "-plist", "/dev/\(containerReference)"]
+        let container = try apfsContainer(reference: containerReference, onCommand: onCommand)
+        guard container.physicalStores.contains(where: { $0.identifier == physicalStoreIdentifier }) else {
+            throw TroubleshooterError.invalidPropertyList(
+                command: "diskutil apfs list -plist /dev/\(containerReference)",
+                reason: "the scanned partition is absent from this container's physical stores"
+            )
+        }
+        return try container.volumes.filter(isUserFacingAPFSVolume).map { record in
+            let info = try diskInfo(identifier: record.identifier, onCommand: onCommand)
+            return externalVolume(
+                info: info,
+                wholeDiskIdentifier: wholeDiskIdentifier,
+                fallbackName: record.name,
+                fallbackSize: record.capacityInUse,
+                physicalStoreIdentifiers: container.physicalStores.map(\.identifier),
+                apfsRecord: record
+            )
+        }
+    }
+
+    private func apfsContainer(
+        reference: String,
+        onCommand: @escaping (String) -> Void
+    ) throws -> APFSContainerRecord {
+        guard wholeDiskIdentifier(forPhysicalStore: reference) == reference else {
+            throw TroubleshooterError.invalidPropertyList(command: "diskutil apfs list -plist", reason: "an invalid APFS container BSD identifier was supplied")
+        }
+        let arguments = ["apfs", "list", "-plist", "/dev/\(reference)"]
         let result = try runChecked(
             executable: "/usr/sbin/diskutil",
             arguments: arguments,
@@ -363,23 +516,26 @@ final class DiskScanner: @unchecked Sendable {
             output: result.output,
             command: renderedCommand(executable: "/usr/sbin/diskutil", arguments: arguments)
         )
-        guard let container = plist.containers.first(where: { $0.reference == containerReference }) else {
+        let matches = plist.containers.filter { $0.reference == reference }
+        guard matches.count == 1, let container = matches.first else {
             throw TroubleshooterError.invalidPropertyList(
                 command: renderedCommand(executable: "/usr/sbin/diskutil", arguments: arguments),
-                reason: "container \(containerReference) was absent from its own response"
+                reason: "container \(reference) was absent or duplicated in its own response"
             )
         }
 
-        return try container.volumes.filter(isUserFacingAPFSVolume).map { record in
-            let info = try diskInfo(identifier: record.identifier, onCommand: onCommand)
-            return externalVolume(
-                info: info,
-                wholeDiskIdentifier: wholeDiskIdentifier,
-                fallbackName: record.name,
-                fallbackSize: record.capacityInUse,
-                apfsRecord: record
+        guard
+            !container.physicalStores.isEmpty,
+            container.physicalStores.count <= 32,
+            Set(container.physicalStores.map(\.identifier)).count == container.physicalStores.count,
+            container.physicalStores.allSatisfy({ wholeDiskIdentifier(forPhysicalStore: $0.identifier) != nil })
+        else {
+            throw TroubleshooterError.invalidPropertyList(
+                command: renderedCommand(executable: "/usr/sbin/diskutil", arguments: arguments),
+                reason: "APFS physical stores are absent, duplicated, invalid or exceed the supported bound"
             )
         }
+        return container
     }
 
     private func externalVolume(
@@ -387,12 +543,14 @@ final class DiskScanner: @unchecked Sendable {
         wholeDiskIdentifier: String,
         fallbackName: String,
         fallbackSize: Int64,
+        physicalStoreIdentifiers: [String],
         apfsRecord: APFSVolumeRecord?
     ) -> ExternalVolume {
         let roles = apfsRecord?.roles.joined(separator: ", ")
         return ExternalVolume(
             identifier: info.identifier,
             wholeDiskIdentifier: wholeDiskIdentifier,
+            physicalStoreIdentifiers: physicalStoreIdentifiers,
             name: nonEmpty(info.volumeName) ?? nonEmpty(apfsRecord?.name) ?? fallbackName,
             filesystem: nonEmpty(info.filesystemName) ?? nonEmpty(info.filesystemType) ?? "Unknown",
             mountPoint: nonEmpty(info.mountPoint),

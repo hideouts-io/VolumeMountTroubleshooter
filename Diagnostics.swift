@@ -8,6 +8,7 @@ struct CommandResult: Sendable {
 struct ExternalVolume: Hashable, Sendable {
     let identifier: String
     let wholeDiskIdentifier: String
+    let physicalStoreIdentifiers: [String]
     let name: String
     let filesystem: String
     let mountPoint: String?
@@ -25,6 +26,8 @@ struct ExternalDisk: Hashable, Sendable {
     let busProtocol: String
     let smartStatus: String
     let expandedSMART: ExpandedSMART
+    let mediaIdentity: PhysicalMediaIdentity
+    let physicalTransport: PhysicalTransport
     let size: Int64
     let volumes: [ExternalVolume]
 }
@@ -159,6 +162,8 @@ struct DiskSnapshot: Sendable {
                 busProtocol: disk.busProtocol,
                 smartStatus: disk.smartStatus,
                 expandedSMART: disk.expandedSMART,
+                mediaIdentity: disk.mediaIdentity,
+                physicalTransport: disk.physicalTransport,
                 size: disk.size,
                 volumes: remainingVolumes
             )
@@ -371,11 +376,21 @@ struct APFSListPropertyList: Decodable {
 
 struct APFSContainerRecord: Decodable {
     let reference: String
+    let physicalStores: [APFSPhysicalStoreRecord]
     let volumes: [APFSVolumeRecord]
 
     enum CodingKeys: String, CodingKey {
         case reference = "ContainerReference"
+        case physicalStores = "PhysicalStores"
         case volumes = "Volumes"
+    }
+}
+
+struct APFSPhysicalStoreRecord: Decodable {
+    let identifier: String
+
+    enum CodingKeys: String, CodingKey {
+        case identifier = "DeviceIdentifier"
     }
 }
 
@@ -632,25 +647,6 @@ func volumeMenuTitle(_ volume: ExternalVolume) -> String {
     return "\(volume.name) — /dev/\(volume.identifier) — \(volume.filesystem) — \(mountState) — \(encryptionState)"
 }
 
-func usbLinkSpeedBitsPerSecond(from output: String, productName: String) -> Int64? {
-    guard !productName.isEmpty else {
-        return nil
-    }
-    let escapedName = NSRegularExpression.escapedPattern(for: productName)
-    let pattern = "(?s)\\+-o\\s+\(escapedName)@[^\\n]*<class IOUSBHostDevice.*?\\\"UsbLinkSpeed\\\"\\s*=\\s*([0-9]+)"
-    guard let expression = try? NSRegularExpression(pattern: pattern) else {
-        return nil
-    }
-    let range = NSRange(output.startIndex..<output.endIndex, in: output)
-    guard
-        let match = expression.firstMatch(in: output, range: range),
-        let speedRange = Range(match.range(at: 1), in: output)
-    else {
-        return nil
-    }
-    return Int64(output[speedRange])
-}
-
 func formattedLinkSpeed(_ bitsPerSecond: Int64) -> String {
     if bitsPerSecond >= 1_000_000_000 {
         let gigabits = Double(bitsPerSecond) / 1_000_000_000
@@ -699,6 +695,7 @@ func privacyRedactedReport(_ report: String, userName: String) -> String {
     let replacements: [(String, String)] = [
         (#"(?i)(USB Serial Number|Serial Number|kUSBSerialNumberString)(\"?\s*[:=]\s*\"?)[A-Za-z0-9._-]+"#, "$1$2[REDACTED]"),
         (#"(?i)(sessionID\"?\s*=\s*)[0-9]+"#, "$1[REDACTED]"),
+        (#"(?i)((?:registryID|locationID)=)0x[0-9a-f]+"#, "$1[REDACTED]"),
         (#"(?i)(UID|Domain UUID|Disk UUID|Volume UUID)(:\s*)[^\s]+"#, "$1$2[REDACTED]"),
         (#"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}"#, "[UUID]")
     ]
@@ -783,6 +780,7 @@ func runSelfTests() -> Bool {
     let testVolume = ExternalVolume(
         identifier: "disk4s1",
         wholeDiskIdentifier: "disk4",
+        physicalStoreIdentifiers: ["disk4"],
         name: "Extreme SSD",
         filesystem: "ExFAT",
         mountPoint: "/Volumes/Extreme SSD",
@@ -795,6 +793,7 @@ func runSelfTests() -> Bool {
     let unmountedVolume = ExternalVolume(
         identifier: "disk6s1",
         wholeDiskIdentifier: "disk6",
+        physicalStoreIdentifiers: ["disk6s2"],
         name: "Unmounted Test",
         filesystem: "APFS",
         mountPoint: nil,
@@ -807,6 +806,7 @@ func runSelfTests() -> Bool {
     let lockedVolume = ExternalVolume(
         identifier: "disk7s1",
         wholeDiskIdentifier: "disk7",
+        physicalStoreIdentifiers: ["disk7s2"],
         name: "Locked Test",
         filesystem: "APFS",
         mountPoint: nil,
@@ -890,6 +890,8 @@ func runSelfTests() -> Bool {
                 busProtocol: "USB",
                 smartStatus: "Verified",
                 expandedSMART: nvmeExpandedSMART ?? .unavailable(reason: "self-test decode failed"),
+                mediaIdentity: .unavailable(reason: "self-test has no hardware observations"),
+                physicalTransport: .unavailable(reason: "self-test has no hardware observations"),
                 size: 2_000_000_000_000,
                 volumes: [testVolume]
             )
@@ -1015,12 +1017,7 @@ func runSelfTests() -> Bool {
         return false
     }
 
-    let ioreg = #"+-o Drive@1 <class IOUSBHostDevice, id 1> { "UsbLinkSpeed" = 10000000000 }"#
-    guard usbLinkSpeedBitsPerSecond(from: ioreg, productName: "Drive") == 10_000_000_000 else {
-        return false
-    }
-
     let report = "USB Serial Number: ABC123\nVolume UUID: 12345678-1234-1234-1234-123456789ABC"
     let redacted = privacyRedactedReport(report, userName: "tester")
-    return !redacted.contains("ABC123") && !redacted.contains("12345678-1234")
+    return !redacted.contains("ABC123") && !redacted.contains("12345678-1234") && runTransportSelfTests()
 }

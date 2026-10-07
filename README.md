@@ -101,7 +101,8 @@ Volume Mount Troubleshooter currently provides:
 - bounded unlock-transition retries with visible progress and hardware-path matching;
 - Finder-only reveal for mounted vendor unlocker volumes without launching their applications;
 - SMART status plus optional temperature, media-error, unsafe-shutdown, power-on-hour, and percentage-used reporting;
-- USB negotiated-link-rate extraction from IOKit when available;
+- selected-storage controller, hub, USB device/bridge and IOMedia ancestry with exact current BSD correlation;
+- negotiated USB link-rate observations, separate descriptor revisions and explicit transport coverage;
 - recent `diskarbitrationd` error and fault collection;
 - native Disk Arbitration notification handling for attached and disconnected devices, including immediate stale-selector removal;
 - exact post-mount verification of mount point and writable state;
@@ -114,7 +115,7 @@ Volume Mount Troubleshooter currently provides:
 
 | Observation | What the app concludes | What the app does not conclude |
 |---|---|---|
-| System Profiler lists a device | The selected hardware data type reported the device. | macOS created a mountable block device. |
+| IOMedia publishes the selected BSD disk | Current block media has an exact registry ancestry. | A product name alone identifies a disk, bridge chipset or chassis port. |
 | `diskutil` lists an external physical disk | Disk Arbitration published the device as external storage. | Every partition contains a supported or healthy filesystem. |
 | SMART reports `Verified` | The transport returned that SMART status. | The disk cannot fail or contains no latent errors. |
 | SMART reports `Not Supported` | SMART was unavailable through the current path. | The disk is healthy or unhealthy. |
@@ -158,9 +159,8 @@ flowchart TB
     end
 
     subgraph Evidence["Read-only evidence collection"]
-        SP["System Profiler USB and Thunderbolt"]
         Info["diskutil disk and volume info"]
-        IOKit["IOKit USB link properties"]
+        IOKit["Selected IOMedia ancestry and USB transport coverage"]
         Logs["Recent diskarbitrationd errors"]
     end
 
@@ -187,7 +187,6 @@ flowchart TB
     APFS --> Selector
     User --> UI
     Selector --> UI
-    UI --> SP
     UI --> Info
     UI --> IOKit
     UI --> Choice
@@ -204,7 +203,6 @@ flowchart TB
     Unmount --> Logs
     Eject --> Logs
     Verify --> Logs
-    SP --> Console
     Info --> Console
     IOKit --> Console
     Logs --> Console
@@ -258,6 +256,8 @@ The generated application is:
 ```text
 build/Volume Mount Troubleshooter.app
 ```
+
+Normal app launches require native execution through `LSRequiresNativeExecution`: `arm64` on Apple Silicon and `x86_64` on Intel Macs. Rosetta translation is not a supported launch mode. [Apple's native launch guidance](https://developer.apple.com/documentation/apple-silicon/building-a-universal-macos-binary)
 
 The historical v0.2 `macos-arm64` release asset remains Apple-Silicon-only. The v0.3.0 release is universal when its filename ends in `macOS-universal.zip` and its checksum matches the accompanying `SHA256SUMS.txt` file.
 
@@ -366,18 +366,13 @@ An encrypted and unlocked volume may be mounted normally or read-only like any o
 
 ## Hardware, SMART, and USB Evidence
 
-### System Profiler
+### Selected physical connection
 
-The app asks System Profiler for USB and Thunderbolt/USB4 attachment data:
+The connection display traces the selected storage device from its current whole-disk `IOMedia` BSD name upward through the IOService registry. Reports retain observed controller, port, hub, storage interface, USB endpoint and block-media ancestry. Product names never establish disk identity. `diskutil` remains authoritative for storage inventory; APFS physical-store records associate synthesized volumes with physical disks. Multiple physical stores or registry parents produce explicit unresolved coverage rather than a guessed single connection.
 
-```sh
-/usr/sbin/system_profiler \
-  SPUSBDataType \
-  SPThunderboltDataType \
-  -detailLevel mini
-```
+Inspect revalidates the selected volume's backing store, device-tree ancestry and current media registry ID. Disk numbers and registry IDs are transient; a replaced media service requires refreshing and selecting the device again. Transport observations are also refreshed with the existing Disk Arbitration inventory flow.
 
-This is attachment-layer evidence only. Some USB storage paths may be present in `diskutil` and IOKit while absent from these System Profiler data types.
+USB product and vendor descriptors and VID/PID identify the enumerated storage device/bridge. They do not establish the internal bridge chipset, SATA/NVMe mapping, cable capability, power availability or chassis port label. Coverage reports distinguish observed data, unavailable properties and unsupported Thunderbolt/USB4 link-rate enrichment. An unenumerated dock or adapter cannot be excluded merely because no USB hub node was observed.
 
 ### SMART
 
@@ -407,13 +402,9 @@ Missing data is shown as unavailable, never as zero. A bridge may suppress, cach
 
 ### USB link speed
 
-The app reads the IOUSB registry plane:
+The native IOKit scanner reads `UsbLinkSpeed` only at USB devices in the selected media's ancestry. The selected storage rate comes from the device directly above a proven mass-storage interface; a hub's rate is reported separately. `bcdUSB` describes a protocol revision and is never converted into an advertised maximum speed. Missing negotiated-rate or capability evidence is shown explicitly. These registry properties vary across macOS versions and hardware.
 
-```sh
-/usr/sbin/ioreg -p IOUSB -l -w0
-```
-
-When the selected product name can be associated with an `IOUSBHostDevice`, the app reports `UsbLinkSpeed` as the negotiated link rate. Full raw IOKit output is not placed in the console because it may contain hardware serial identifiers.
+Only allowlisted properties from the selected path are collected. Serial numbers, session IDs and unrelated USB devices are not collected by the transport scanner. PlugSense's [probe and registry APIs](https://github.com/yasir24s/PlugSense/tree/eb3b4e73927c02dfa65abb66f6a6038fb9b90303/Sources/PlugSenseKit) were inspected as a reference. PlugSense is GPL-3.0; this MIT project uses an independent native implementation without copied code, tests, assets or dependencies.
 
 The reported link rate is not a benchmark. Cable quality, bridge behavior, queue depth, filesystem overhead, thermals, and the storage medium determine real transfer performance.
 
@@ -454,14 +445,12 @@ The application constructs commands only from fixed absolute executable paths, f
 
 | Purpose | Command |
 |---|---|
-| Attachment inventory | `/usr/sbin/system_profiler SPUSBDataType SPThunderboltDataType -detailLevel mini` |
 | External disk display | `/usr/sbin/diskutil list external physical` |
 | Typed external disk inventory | `/usr/sbin/diskutil list -plist external physical` |
 | Disk or volume details | `/usr/sbin/diskutil info /dev/diskN` |
 | Typed disk or volume details | `/usr/sbin/diskutil info -plist /dev/diskNsN` |
 | Typed APFS inventory | `/usr/sbin/diskutil apfs list -plist /dev/diskN` |
 | Optional expanded SMART JSON | `<known smartctl path> --all --json /dev/diskN` |
-| USB registry evidence | `/usr/sbin/ioreg -p IOUSB -l -w0` |
 | Recent Disk Arbitration errors | `/usr/bin/log show --last 15m ...` |
 | Selected-volume unmount | `/usr/sbin/diskutil unmount /dev/diskNsN` |
 | Selected-volume read-only mount | `/usr/sbin/diskutil mount readOnly /dev/diskNsN` |
@@ -469,6 +458,8 @@ The application constructs commands only from fixed absolute executable paths, f
 | Whole external disk eject | `/usr/sbin/diskutil eject /dev/diskN` |
 
 No user-entered text is interpolated into a shell command. `Process` receives the executable path and argument array directly.
+
+Selected-path collection uses native `IOBSDNameMatching`, unique `IOMedia` matching and IOService parent iteration rather than a shell command or a general USB inventory.
 
 ---
 
@@ -484,7 +475,7 @@ The app keeps raw command evidence and guided interpretation separate.
 - mount point and writable-volume state;
 - encryption, FileVault, and locked fields;
 - overall SMART status and any detailed controller/vendor counters returned through the current storage path;
-- IOKit USB link properties; and
+- selected-storage IOMedia ancestry, USB identity and negotiated link properties; and
 - recent retained Disk Arbitration error and fault entries.
 
 ### Derived interpretations
@@ -536,6 +527,7 @@ Command-launch failures, malformed property lists, missing required fields, canc
 - the signed-in username within `/Users/...` paths;
 - USB and storage serial-number fields;
 - IOKit session identifiers;
+- transport registry-entry and USB location identifiers;
 - hardware UIDs;
 - disk and volume UUID fields; and
 - UUID-shaped values elsewhere in the report.
@@ -574,7 +566,7 @@ The self-test covers:
 - coexistence of usable volumes and exact per-disk scan failures;
 - explicit-action availability for unmounted, writable-mounted, locked, and absent selections;
 - standardized NVMe and conservative ATA expanded-SMART JSON parsing;
-- USB link-speed extraction; and
+- physical-store correlation, ambiguous APFS mappings, USB endpoint attribution, unavailable-media errors and transport cancellation;
 - privacy redaction of serial numbers and UUIDs.
 
 ### Universal release archive and checksum
@@ -590,7 +582,7 @@ VolumeMountTroubleshooter-vVERSION-macOS-universal.zip
 VolumeMountTroubleshooter-vVERSION-SHA256SUMS.txt
 ```
 
-The packaging script rebuilds the app, verifies its universal architecture set and strict ad-hoc signature, creates the ZIP, generates its SHA-256 checksum, extracts the ZIP into a temporary directory, re-verifies the signature and architectures, and runs the self-tests from the extracted bundle.
+The packaging script rebuilds the app, verifies its universal architecture set and strict ad-hoc signature, creates the ZIP, generates its SHA-256 checksum, extracts the ZIP into a temporary directory, re-verifies the signature, architectures and required native launch policy, and runs the self-tests from the extracted bundle.
 
 You can repeat the checksum verification with:
 
@@ -650,6 +642,9 @@ VolumeMountTroubleshooter/
 ├── assets/AppIcon.png      # Canonical project logo source
 ├── assets/AppIcon.icns     # Multi-resolution macOS application icon
 ├── Diagnostics.swift       # Typed models, plist decoding, redaction, guidance
+├── PhysicalTransport.swift # Selected-path model, coverage and bounded explanations
+├── TransportScanner.swift  # Read-only exact BSD/IOMedia ancestry collector
+├── TransportSelfTests.swift # Correlation, unavailable-media and privacy checks
 ├── docs/HARDWARE_TEST_MATRIX.md # Physical-device validation cases and records
 ├── SystemConnectors.swift  # Process, disk scanner, Disk Arbitration monitor
 ├── main.swift              # Application entry point and test modes
@@ -671,7 +666,8 @@ Generated applications under `build/` and release files under `dist/` are intent
 
 - The app is ad-hoc signed, not Developer ID signed, notarized, or distributed as a DMG or installer package.
 - Only external physical storage published by `diskutil` is considered. Internal disks, disk images, network shares, and cloud-storage providers are outside scope.
-- System Profiler may omit a connected USB device even when `diskutil` and IOKit report it.
+- Transport ancestry requires current IOMedia. A device that has not published a BSD disk cannot be associated with the selected storage path.
+- Multi-store APFS volumes have no single attributed transport path; Thunderbolt/USB4 link-rate and advertised maximum-rate enrichment remain unsupported or unavailable.
 - SMART is frequently unavailable through USB bridges; expanded counters also require an existing compatible `smartctl` collector.
 - USB link speed is not storage throughput.
 - Locked encrypted volumes must be unlocked outside the app.

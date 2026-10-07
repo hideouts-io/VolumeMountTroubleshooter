@@ -46,6 +46,14 @@ fi
 
 /usr/bin/xcrun lipo "$binary_path" -verify_arch arm64
 /usr/bin/xcrun lipo "$binary_path" -verify_arch x86_64
+if ! native_execution="$(/usr/bin/plutil -extract LSRequiresNativeExecution raw -expect bool "$app_path/Contents/Info.plist")"; then
+    print -u2 "Release app is missing a valid boolean LSRequiresNativeExecution in Contents/Info.plist. Rebuild with the native launch policy before packaging."
+    exit 1
+fi
+if [[ "$native_execution" != "true" ]]; then
+    print -u2 "Release app permits Rosetta translation: LSRequiresNativeExecution must be true. Rebuild with the native launch policy before packaging."
+    exit 1
+fi
 /usr/bin/codesign --verify --deep --strict --verbose=2 "$app_path"
 "$binary_path" --self-test
 
