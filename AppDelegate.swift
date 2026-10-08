@@ -24,6 +24,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var volumePopup: NSPopUpButton?
     private var volumeDetailLabel: NSTextField?
     private var smartDetailLabel: NSTextField?
+    private var connectionPathLabel: NSTextField?
     private var unlockProgressLabel: NSTextField?
     private var redactCheckbox: NSButton?
     private var inspectButton: NSButton?
@@ -126,6 +127,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         selectorLabel.font = NSFont.systemFont(ofSize: 13, weight: .medium)
 
         let volumePopup = NSPopUpButton()
+        volumePopup.setAccessibilityIdentifier("volumeSelector")
         volumePopup.addItem(withTitle: "Scanning for external volumes…")
         volumePopup.isEnabled = false
         volumePopup.target = self
@@ -133,6 +135,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         self.volumePopup = volumePopup
 
         let refreshButton = NSButton(title: "Refresh", target: self, action: #selector(refreshPressed))
+        refreshButton.setAccessibilityIdentifier("refreshButton")
         refreshButton.bezelStyle = .rounded
         self.refreshButton = refreshButton
 
@@ -153,6 +156,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         smartDetailLabel.isHidden = true
         self.smartDetailLabel = smartDetailLabel
 
+        let connectionPathLabel = NSTextField(wrappingLabelWithString: "")
+        connectionPathLabel.textColor = .secondaryLabelColor
+        connectionPathLabel.font = NSFont.systemFont(ofSize: 12)
+        connectionPathLabel.isSelectable = true
+        connectionPathLabel.isHidden = true
+        connectionPathLabel.setAccessibilityIdentifier("connectionPath")
+        self.connectionPathLabel = connectionPathLabel
+
         let unlockProgressLabel = NSTextField(wrappingLabelWithString: "")
         unlockProgressLabel.font = NSFont.systemFont(ofSize: 12, weight: .medium)
         unlockProgressLabel.textColor = .systemOrange
@@ -160,6 +171,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         self.unlockProgressLabel = unlockProgressLabel
 
         let redactCheckbox = NSButton(checkboxWithTitle: "Redact shared reports", target: self, action: nil)
+        redactCheckbox.setAccessibilityIdentifier("redactSharedReports")
         redactCheckbox.state = .on
         self.redactCheckbox = redactCheckbox
 
@@ -179,6 +191,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         inspectButton.bezelStyle = .rounded
         inspectButton.keyEquivalent = "\r"
         inspectButton.identifier = NSUserInterfaceItemIdentifier("inspectButton")
+        inspectButton.setAccessibilityIdentifier("inspectButton")
         inspectButton.toolTip = "Collect read-only disk, volume, USB, SMART, encryption, and Disk Arbitration evidence."
         inspectButton.isEnabled = false
         self.inspectButton = inspectButton
@@ -217,6 +230,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         self.unmountButton = unmountButton
 
         let stopButton = NSButton(title: "Stop", target: self, action: #selector(stopTroubleshooting))
+        stopButton.setAccessibilityIdentifier("stopButton")
         stopButton.bezelStyle = .rounded
         stopButton.isEnabled = false
         self.stopButton = stopButton
@@ -241,11 +255,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         let copyButton = NSButton(title: "Copy Report", target: self, action: #selector(copyLog))
         copyButton.bezelStyle = .rounded
+        copyButton.setAccessibilityIdentifier("copyReportButton")
         copyButton.isEnabled = false
         self.copyButton = copyButton
 
         let saveButton = NSButton(title: "Save Report…", target: self, action: #selector(saveReport))
         saveButton.bezelStyle = .rounded
+        saveButton.setAccessibilityIdentifier("saveReportButton")
         saveButton.isEnabled = false
         self.saveButton = saveButton
 
@@ -277,11 +293,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         let scrollView = NSScrollView()
         scrollView.hasVerticalScroller = true
-        scrollView.hasHorizontalScroller = true
+        scrollView.hasHorizontalScroller = false
         scrollView.autohidesScrollers = false
         scrollView.borderType = .bezelBorder
 
         let textView = NSTextView()
+        textView.setAccessibilityIdentifier("diagnosticConsole")
         textView.isEditable = false
         textView.isSelectable = true
         textView.isRichText = false
@@ -289,6 +306,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         textView.textColor = NSColor(calibratedRed: 0.78, green: 0.94, blue: 0.80, alpha: 1)
         textView.backgroundColor = NSColor(calibratedWhite: 0.08, alpha: 1)
         textView.textContainerInset = NSSize(width: 10, height: 10)
+        textView.isHorizontallyResizable = false
+        textView.isVerticallyResizable = true
+        textView.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
+        textView.textContainer?.widthTracksTextView = true
+        textView.textContainer?.containerSize = NSSize(width: scrollView.contentSize.width, height: CGFloat.greatestFiniteMagnitude)
         textView.autoresizingMask = [.width]
         scrollView.documentView = textView
         self.textView = textView
@@ -298,6 +320,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             selectorStack,
             volumeDetailLabel,
             smartDetailLabel,
+            connectionPathLabel,
             unlockProgressLabel,
             optionStack,
             statusLabel,
@@ -321,6 +344,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             selectorStack,
             volumeDetailLabel,
             smartDetailLabel,
+            connectionPathLabel,
             unlockProgressLabel,
             optionStack,
             statusLabel,
@@ -345,6 +369,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             selectorStack.widthAnchor.constraint(equalTo: contentStack.widthAnchor),
             volumeDetailLabel.widthAnchor.constraint(equalTo: contentStack.widthAnchor),
             smartDetailLabel.widthAnchor.constraint(equalTo: contentStack.widthAnchor),
+            connectionPathLabel.widthAnchor.constraint(equalTo: contentStack.widthAnchor),
             unlockProgressLabel.widthAnchor.constraint(equalTo: contentStack.widthAnchor),
             optionStack.widthAnchor.constraint(equalTo: contentStack.widthAnchor),
             statusLabel.widthAnchor.constraint(equalTo: contentStack.widthAnchor),
@@ -383,16 +408,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func handleDiskDisappearance(identifier: String) {
         let selectedIdentifier = selectedVolume()?.identifier
-        let selectedWasRemoved = selectedIdentifier.map {
-            deviceIdentifier($0, isSameAsOrDescendantOf: identifier)
-        } ?? false
         let scanWasRunning = isRefreshing
         let updatedSnapshot = snapshot.removingDevice(identifier: identifier)
+        let selectedWasRemoved = selectedIdentifier.map { selected in
+            !updatedSnapshot.volumes.contains { $0.identifier == selected }
+        } ?? false
         let trackedUnlockerWasRemoved = trackedUnlocker.map { unlocker in
             !updatedSnapshot.unlockers.contains(unlocker)
         } ?? false
         if selectedWasRemoved {
             selectionRequiresUserChoice = true
+            if isRunning {
+                runner.cancel()
+                appendLog("SELECTED STORAGE DISCONNECTED: stopping the operation; select the device again after it reappears.\n")
+            }
         }
 
         scanGeneration += 1
@@ -413,8 +442,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         updateSelectionDetails()
         setControlsForRunningState(isRunning)
-        setStatus("Disconnected /dev/\(identifier) — stale selection cleared", color: .systemOrange)
-        appendLog("AUTO-DETECT: /dev/\(identifier) disappeared; its stale selector entry was removed immediately.\n")
+        if selectedWasRemoved {
+            setStatus("Selected storage disconnected — choose the volume again", color: .systemOrange)
+            if !isRunning {
+                appendLog("SELECTED STORAGE DISCONNECTED: /dev/\(identifier) disappeared; the selected volume was cleared.\n")
+            }
+        }
 
         if !scanWasRunning {
             scheduleAutomaticRefresh()
@@ -500,7 +533,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         scanGeneration += 1
         let currentScanGeneration = scanGeneration
         isRefreshing = true
-        refreshButton?.isEnabled = false
+        setControlsForRunningState(isRunning)
         setStatus(automatic ? "Checking for attached volumes…" : "Refreshing external volumes…", color: .systemBlue)
         let previousIdentifiers = Set(snapshot.volumes.map(\.identifier))
         let selectedIdentifier = selectedVolume()?.identifier
@@ -559,6 +592,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         previousIdentifiers: Set<String>,
         automatic: Bool
     ) {
+        if let selectedIdentifier {
+            let oldDisk = snapshot.volumes.first { $0.identifier == selectedIdentifier }
+                .flatMap { snapshot.disk(containing: $0) }
+            let newDisk = newSnapshot.volumes.first { $0.identifier == selectedIdentifier }
+                .flatMap { newSnapshot.disk(containing: $0) }
+            if newDisk == nil || oldDisk?.mediaIdentity != newDisk?.mediaIdentity {
+                selectionRequiresUserChoice = true
+            }
+        }
         snapshot = newSnapshot
         volumePopup?.removeAllItems()
         if selectionRequiresUserChoice, !newSnapshot.volumes.isEmpty {
@@ -769,6 +811,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard let volume = selectedVolume(), let disk = snapshot.disk(containing: volume) else {
             smartDetailLabel?.stringValue = ""
             smartDetailLabel?.isHidden = true
+            connectionPathLabel?.stringValue = ""
+            connectionPathLabel?.toolTip = nil
+            connectionPathLabel?.isHidden = true
             if let trackedUnlocker {
                 volumeDetailLabel?.stringValue = "Detected \(trackedUnlocker.name), which is the vendor unlock helper rather than the data volume. No application or credential prompt is opened automatically."
                 setStatus("Unlock helper detected — waiting for the data volume", color: .systemOrange)
@@ -780,7 +825,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         let mountState = volume.mountPoint.map { "Mounted at \($0)" } ?? "Not mounted"
-        let encryptionState = volume.isLocked ? "encrypted and locked" : (volume.isEncrypted ? "encrypted and unlocked" : "not encrypted")
+        let encryptionState = encryptionStateSummary(volume)
         let role = volume.role.map { " • APFS role: \($0)" } ?? ""
         volumeDetailLabel?.stringValue = "\(mountState) • \(encryptionState) • \(formattedByteCount(volume.size)) • \(disk.busProtocol) • SMART: \(disk.smartStatus)\(role)"
         let smartLines = [
@@ -789,6 +834,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         ].compactMap { $0 }
         smartDetailLabel?.stringValue = smartLines.joined(separator: "\n")
         smartDetailLabel?.isHidden = false
+        let transport = selectedPhysicalTransport(volume: volume, disk: disk)
+        connectionPathLabel?.stringValue = physicalConnectionSummary(transport)
+        connectionPathLabel?.toolTip = physicalTransportReport(
+            transport: transport,
+            selectedIdentifier: volume.identifier,
+            physicalStoreIdentifiers: volume.physicalStoreIdentifiers,
+            smartStatus: disk.smartStatus
+        )
+        connectionPathLabel?.isHidden = false
         setStatus("Ready — choose an explicit action for the selected volume", color: .labelColor)
     }
 
@@ -800,7 +854,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func inspectSelectedVolume() {
-        guard !isRunning, let volume = selectedVolume(), let disk = snapshot.disk(containing: volume) else {
+        guard !isRunning, !isRefreshing, let volume = selectedVolume(), let disk = snapshot.disk(containing: volume) else {
             return
         }
         guard volumeActionAvailability(for: volume).inspect else {
@@ -814,13 +868,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func mountSelectedVolumeReadOnly() {
-        guard !isRunning, let volume = selectedVolume(), let disk = snapshot.disk(containing: volume) else {
+        guard !isRunning, !isRefreshing, let volume = selectedVolume(), let disk = snapshot.disk(containing: volume) else {
             return
         }
         guard volumeActionAvailability(for: volume).mountReadOnly else {
             return
         }
-        let requiresReadOnlyRemount = nonEmpty(volume.mountPoint) != nil && volume.isWritable
+        let requiresReadOnlyRemount = nonEmpty(volume.mountPoint) != nil && volume.isWritable == true
         if requiresReadOnlyRemount && !confirmReadOnlyRemount(volume: volume) {
             return
         }
@@ -832,7 +886,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func mountSelectedVolumeNormally() {
-        guard !isRunning, let volume = selectedVolume(), let disk = snapshot.disk(containing: volume) else {
+        guard !isRunning, !isRefreshing, let volume = selectedVolume(), let disk = snapshot.disk(containing: volume) else {
             return
         }
         guard volumeActionAvailability(for: volume).mountNormally else {
@@ -846,7 +900,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func unmountSelectedVolume() {
-        guard !isRunning, let volume = selectedVolume(), let disk = snapshot.disk(containing: volume) else {
+        guard !isRunning, !isRefreshing, let volume = selectedVolume(), let disk = snapshot.disk(containing: volume) else {
             return
         }
         guard volumeActionAvailability(for: volume).unmountVolume else {
@@ -887,6 +941,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func ejectSelectedDisk() {
         guard
             !isRunning,
+            !isRefreshing,
             let volume = selectedVolume(),
             let disk = snapshot.disk(containing: volume)
         else {
@@ -914,6 +969,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             self.postOperationHeader(action: "Safe Eject Disk", volume: volume, disk: disk)
             do {
+                _ = try self.validatedSelectedVolume(volume: volume, disk: disk, runner: self.runner)
                 let result = try self.runLogged(
                     executable: "/usr/sbin/diskutil",
                     arguments: ["eject", devicePath],
@@ -943,21 +999,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func saveReport() {
+        guard let window else {
+            setStatus("Report save failed: the application window is unavailable", color: .systemRed)
+            appendLog("REPORT SAVE FAILED: the application window is unavailable.\n")
+            return
+        }
+        let report = reportForSharing()
         let formatter = DateFormatter()
         formatter.dateFormat = "yyyyMMdd-HHmmss"
         let panel = NSSavePanel()
         panel.nameFieldStringValue = "volume-mount-report-\(formatter.string(from: Date())).txt"
         panel.allowedContentTypes = [.plainText]
         panel.canCreateDirectories = true
-        guard panel.runModal() == .OK, let destination = panel.url else {
-            return
-        }
-
-        do {
-            try reportForSharing().write(to: destination, atomically: true, encoding: .utf8)
-            setStatus("Report saved to \(destination.path)", color: .systemGreen)
-        } catch {
-            setStatus("Report save failed: \(error.localizedDescription)", color: .systemRed)
+        panel.beginSheetModal(for: window) { [weak self] response in
+            guard let self, response == .OK else { return }
+            guard let destination = panel.url else {
+                self.setStatus("Report save failed: the save dialog returned no destination", color: .systemRed)
+                self.appendLog("REPORT SAVE FAILED: the save dialog returned no destination. Choose a writable folder and try again.\n")
+                return
+            }
+            do {
+                try report.write(to: destination, atomically: true, encoding: .utf8)
+                self.setStatus("Report saved to \(destination.path)", color: .systemGreen)
+            } catch {
+                self.setStatus("Report save failed: \(error.localizedDescription)", color: .systemRed)
+                self.appendLog("REPORT SAVE FAILED: \(error.localizedDescription)\n")
+            }
         }
     }
 
@@ -1006,8 +1073,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         postOperationHeader(action: "Inspect", volume: volume, disk: disk)
         do {
-            try collectInspectionEvidence(volume: volume, disk: disk, runner: runner)
-            try appendDiskArbitrationErrors(runner: runner)
+            _ = try collectInspectionEvidence(volume: volume, disk: disk, runner: runner)
+            try appendDiskArbitrationErrors(volume: volume, runner: runner)
             finishSuccess("Inspection complete for \(volume.name)")
         } catch TroubleshooterError.cancelled {
             finishCancelled()
@@ -1032,15 +1099,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         postOperationHeader(action: "Mount Read-Only", volume: volume, disk: disk)
         do {
-            try collectInspectionEvidence(volume: volume, disk: disk, runner: runner)
-            guard !volume.isLocked else {
+            _ = try collectInspectionEvidence(volume: volume, disk: disk, runner: runner)
+            let currentVolume = try validatedSelectedVolume(volume: volume, disk: disk, runner: runner)
+            guard currentVolume.isLocked != true else {
                 postLog(guidedFailureExplanation(exitStatus: 1, output: "volume locked", volume: volume) + "\n")
-                try appendDiskArbitrationErrors(runner: runner)
+                try appendDiskArbitrationErrors(volume: volume, runner: runner)
                 finishFailure("Selected volume is encrypted and locked")
                 return
             }
 
-            if nonEmpty(volume.mountPoint) != nil, volume.isWritable {
+            guard currentVolume.mountPoint == volume.mountPoint, currentVolume.isWritable == volume.isWritable else {
+                throw TroubleshooterError.selectedStorageChanged(reason: "the selected volume's mount or writable state changed before the read-only request")
+            }
+            if nonEmpty(currentVolume.mountPoint) != nil, currentVolume.isWritable == true {
                 let unmount = try runLogged(
                     executable: "/usr/sbin/diskutil",
                     arguments: ["unmount", "/dev/\(volume.identifier)"],
@@ -1048,7 +1119,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 )
                 guard unmount.exitStatus == 0 else {
                     postLog(guidedFailureExplanation(exitStatus: unmount.exitStatus, output: unmount.output, volume: volume) + "\n")
-                    try appendDiskArbitrationErrors(runner: runner)
+                    try appendDiskArbitrationErrors(volume: volume, runner: runner)
                     finishFailure("Could not unmount the selected volume for read-only remount")
                     return
                 }
@@ -1056,10 +1127,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
             let outcome = try runMountRequest(
                 volume: volume,
+                disk: disk,
                 arguments: ["mount", "readOnly", "/dev/\(volume.identifier)"],
                 runner: runner
             )
-            try appendDiskArbitrationErrors(runner: runner)
+            try appendDiskArbitrationErrors(volume: volume, runner: runner)
 
             guard outcome.mountResult.exitStatus == 0 else {
                 postLog(guidedFailureExplanation(exitStatus: outcome.mountResult.exitStatus, output: outcome.mountResult.output, volume: volume) + "\n")
@@ -1076,8 +1148,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 finishFailure("Mount command succeeded, but no mount point was verified")
                 return
             }
-            if currentInfo.writableVolume == true {
-                postLog("GUIDED EXPLANATION: macOS mounted the volume writable even though read-only was requested.\n")
+            guard currentInfo.writableVolume == false else {
+                let reason = currentInfo.writableVolume == true
+                    ? "macOS reports a writable volume despite the read-only request"
+                    : "macOS did not report the volume's writable state"
+                postLog("READ-ONLY VERIFICATION FAILED: \(reason). Check this volume in Disk Utility before using it.\n")
                 finishFailure("Read-only state was not verified at \(mountPoint)")
                 return
             }
@@ -1107,20 +1182,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         postOperationHeader(action: "Mount Normally", volume: volume, disk: disk)
         do {
-            try collectInspectionEvidence(volume: volume, disk: disk, runner: runner)
-            guard !volume.isLocked else {
+            _ = try collectInspectionEvidence(volume: volume, disk: disk, runner: runner)
+            let currentVolume = try validatedSelectedVolume(volume: volume, disk: disk, runner: runner)
+            guard currentVolume.isLocked != true else {
                 postLog(guidedFailureExplanation(exitStatus: 1, output: "volume locked", volume: volume) + "\n")
-                try appendDiskArbitrationErrors(runner: runner)
+                try appendDiskArbitrationErrors(volume: volume, runner: runner)
                 finishFailure("Selected volume is encrypted and locked")
                 return
             }
 
             let outcome = try runMountRequest(
                 volume: volume,
+                disk: disk,
                 arguments: ["mount", "/dev/\(volume.identifier)"],
                 runner: runner
             )
-            try appendDiskArbitrationErrors(runner: runner)
+            try appendDiskArbitrationErrors(volume: volume, runner: runner)
             guard outcome.mountResult.exitStatus == 0 else {
                 postLog(guidedFailureExplanation(exitStatus: outcome.mountResult.exitStatus, output: outcome.mountResult.output, volume: volume) + "\n")
                 finishFailure("Normal mount failed for /dev/\(volume.identifier)")
@@ -1162,12 +1239,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         postOperationHeader(action: "Unmount Volume", volume: volume, disk: disk)
         do {
+            _ = try validatedSelectedVolume(volume: volume, disk: disk, runner: runner)
             let result = try runLogged(
                 executable: "/usr/sbin/diskutil",
                 arguments: ["unmount", "/dev/\(volume.identifier)"],
                 runner: runner
             )
-            try appendDiskArbitrationErrors(runner: runner)
+            try appendDiskArbitrationErrors(volume: volume, runner: runner)
             guard result.exitStatus == 0 else {
                 postLog(guidedFailureExplanation(exitStatus: result.exitStatus, output: result.output, volume: volume) + "\n")
                 finishFailure("Unmount failed for /dev/\(volume.identifier)")
@@ -1201,80 +1279,63 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         volume: ExternalVolume,
         disk: ExternalDisk,
         runner: CommandRunner
-    ) throws {
-        let profiler = try runLogged(
-            executable: "/usr/sbin/system_profiler",
-            arguments: ["SPUSBDataType", "SPThunderboltDataType", "-detailLevel", "mini"],
-            runner: runner
+    ) throws -> ExternalVolume {
+        let evidence = try DiskScanner(runner: runner).currentSelectedStorageEvidence(
+            volume: volume,
+            disk: disk,
+            onCommand: postCollectionStep
         )
-        if profiler.exitStatus != 0 {
-            postLog("WARNING: System Profiler failed; diskutil remains the authoritative storage inventory.\n\n")
-        }
-
-        let externalList = try runLogged(
-            executable: "/usr/sbin/diskutil",
-            arguments: ["list", "external", "physical"],
-            runner: runner
-        )
-        guard externalList.exitStatus == 0 else {
-            throw TroubleshooterError.commandFailed(
-                command: "/usr/sbin/diskutil list external physical",
-                exitStatus: externalList.exitStatus,
-                output: externalList.output
+        let currentVolume = evidence.state.volume
+        let smartStatus = nonEmpty(evidence.state.wholeDiskInfo.smartStatus) ?? "Unavailable"
+        postLog(selectedStorageReport(
+            volume: currentVolume,
+            diskInfo: evidence.state.wholeDiskInfo,
+            expandedSMART: evidence.expandedSMART
+        ))
+        postLog(physicalTransportReport(
+            transport: evidence.transport,
+            selectedIdentifier: currentVolume.identifier,
+            physicalStoreIdentifiers: currentVolume.physicalStoreIdentifiers,
+            smartStatus: smartStatus
+        ))
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.selectedVolume()?.identifier == volume.identifier else {
+                return
+            }
+            self.connectionPathLabel?.stringValue = physicalConnectionSummary(evidence.transport)
+            self.connectionPathLabel?.toolTip = physicalTransportReport(
+                transport: evidence.transport,
+                selectedIdentifier: currentVolume.identifier,
+                physicalStoreIdentifiers: currentVolume.physicalStoreIdentifiers,
+                smartStatus: smartStatus
             )
         }
-        let diskInfo = try runLogged(
-            executable: "/usr/sbin/diskutil",
-            arguments: ["info", "/dev/\(disk.identifier)"],
-            runner: runner
-        )
-        guard diskInfo.exitStatus == 0 else {
-            throw TroubleshooterError.commandFailed(
-                command: "/usr/sbin/diskutil info /dev/\(disk.identifier)",
-                exitStatus: diskInfo.exitStatus,
-                output: diskInfo.output
-            )
-        }
-        postLog("DEVICE HEALTH: bus=\(disk.busProtocol), SMART=\(disk.smartStatus), size=\(formattedByteCount(disk.size))\n\n")
-        postLog("\(expandedSMARTSummary(disk.expandedSMART))\n")
-        if let caveat = expandedSMARTCaveat(disk.expandedSMART) {
-            postLog("\(caveat)\n")
-        }
-        postLog("\n")
+        return currentVolume
+    }
 
-        let ioreg = try runCaptured(
-            executable: "/usr/sbin/ioreg",
-            arguments: ["-p", "IOUSB", "-l", "-w0"],
-            reason: "raw output omitted because it can contain hardware serial identifiers",
-            runner: runner
-        )
-        if let speed = usbLinkSpeedBitsPerSecond(from: ioreg.output, productName: disk.name) {
-            postLog("USB CONNECTION SPEED: \(formattedLinkSpeed(speed)) for \(disk.name)\n\n")
-        } else {
-            postLog("USB CONNECTION SPEED: unavailable for \(disk.name); the device may use a path not exposed in the IOUSB plane.\n\n")
-        }
+    nonisolated private func postCollectionStep(_ step: String) {
+        postLog(step.hasPrefix("/") ? "$ \(step)\n" : "\(step)\n")
+    }
 
-        let volumeInfo = try runLogged(
-            executable: "/usr/sbin/diskutil",
-            arguments: ["info", "/dev/\(volume.identifier)"],
-            runner: runner
-        )
-        guard volumeInfo.exitStatus == 0 else {
-            throw TroubleshooterError.commandFailed(
-                command: "/usr/sbin/diskutil info /dev/\(volume.identifier)",
-                exitStatus: volumeInfo.exitStatus,
-                output: volumeInfo.output
-            )
-        }
-        let encryptionState = volume.isLocked ? "encrypted and locked" : (volume.isEncrypted ? "encrypted and unlocked" : "not encrypted")
-        postLog("ENCRYPTION CHECK: \(encryptionState). No credentials were requested.\n\n")
+    nonisolated private func validatedSelectedVolume(
+        volume: ExternalVolume,
+        disk: ExternalDisk,
+        runner: CommandRunner
+    ) throws -> ExternalVolume {
+        try DiskScanner(runner: runner).validatedSelectedStorage(
+            volume: volume,
+            disk: disk,
+            onCommand: postCollectionStep
+        ).volume
     }
 
     nonisolated private func runMountRequest(
         volume: ExternalVolume,
+        disk: ExternalDisk,
         arguments: [String],
         runner: CommandRunner
     ) throws -> MountRequestOutcome {
+        _ = try validatedSelectedVolume(volume: volume, disk: disk, runner: runner)
         let mountResult = try runLogged(
             executable: "/usr/sbin/diskutil",
             arguments: arguments,
@@ -1284,7 +1345,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let verificationResult = try runCaptured(
             executable: "/usr/sbin/diskutil",
             arguments: verifyArguments,
-            reason: "structured plist decoded for mount verification",
+            reason: "structured output captured for mount verification",
             runner: runner
         )
         let currentInfo = verificationResult.exitStatus == 0
@@ -1294,6 +1355,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 command: renderedCommand(executable: "/usr/sbin/diskutil", arguments: verifyArguments)
             )
             : nil
+        if let currentInfo, currentInfo.identifier != volume.identifier {
+            throw TroubleshooterError.selectedStorageChanged(reason: "mount verification returned a different volume")
+        }
+        let verifiedVolume = try validatedSelectedVolume(volume: volume, disk: disk, runner: runner)
+        if let currentInfo {
+            guard verifiedVolume.mountPoint == nonEmpty(currentInfo.mountPoint),
+                verifiedVolume.isWritable == currentInfo.writableVolume
+            else {
+                throw TroubleshooterError.selectedStorageChanged(reason: "the mount or writable state changed during mount verification")
+            }
+        }
         return MountRequestOutcome(
             mountResult: mountResult,
             verificationResult: verificationResult,
@@ -1301,8 +1373,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         )
     }
 
-    nonisolated private func appendDiskArbitrationErrors(runner: CommandRunner) throws {
-        let result = try runLogged(
+    nonisolated private func appendDiskArbitrationErrors(volume: ExternalVolume, runner: CommandRunner) throws {
+        let selectedPattern = ".*\\\\b\(volume.identifier)\\\\b.*"
+        let wholePattern = ".*\\\\b\(volume.wholeDiskIdentifier)(s[0-9]+)*\\\\b.*"
+        let predicate = "process == \"diskarbitrationd\" AND (messageType == error OR messageType == fault) AND (eventMessage MATCHES[c] \"\(selectedPattern)\" OR eventMessage MATCHES[c] \"\(wholePattern)\")"
+        let result = try runCaptured(
             executable: "/usr/bin/log",
             arguments: [
                 "show",
@@ -1311,13 +1386,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 "--style",
                 "compact",
                 "--predicate",
-                "process == \"diskarbitrationd\" AND (messageType == error OR messageType == fault)"
+                predicate
             ],
+            reason: "Selected-storage Disk Arbitration log",
             runner: runner
         )
-        if result.exitStatus == 0, result.output.split(separator: "\n").count <= 1 {
-            postLog("DISK ARBITRATION LOG CHECK: no error or fault entries in the last 15 minutes.\n\n")
+        guard result.exitStatus == 0 else {
+            throw TroubleshooterError.commandFailed(
+                command: renderedCommand(executable: "/usr/bin/log", arguments: ["show", "--last", "15m", "--style", "compact", "--predicate", predicate]),
+                exitStatus: result.exitStatus,
+                output: "Selected-storage log coverage failed.\n\(result.output)"
+            )
         }
+        let logBody = diskArbitrationLogBody(result.output)
+        if logBody.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            postLog("Disk Arbitration: no error or fault entries naming these current disk identifiers in the last 15 minutes.\n")
+        } else {
+            postLog(logBody)
+            if !logBody.hasSuffix("\n") { postLog("\n") }
+        }
+        postLog("Log coverage: earlier entries may refer to a different device that used the same disk number; entries without these identifiers cannot be correlated.\n\n")
     }
 
     nonisolated private func runLogged(
@@ -1354,7 +1442,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             arguments: arguments,
             timeoutSeconds: 30
         ) { _ in }
-        postLog("[\(reason)]\n")
+        if result.exitStatus == 0 {
+            postLog("[\(reason)]\n")
+        } else {
+            postLog(result.output)
+            if !result.output.hasSuffix("\n") { postLog("\n") }
+        }
         postLog("[exit status: \(result.exitStatus)]\n\n")
         return result
     }
@@ -1381,7 +1474,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     nonisolated private func finishCancelled() {
         DispatchQueue.main.async { [weak self] in
-            self?.appendLog("\nRESULT: CANCELLED by user\n")
+            self?.appendLog("\nRESULT: CANCELLED — operation stopped\n")
             self?.finish("Cancelled", color: .systemOrange)
         }
     }

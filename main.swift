@@ -6,7 +6,7 @@ struct VolumeMountTroubleshooterApplication {
     @MainActor
     static func main() {
         if CommandLine.arguments.dropFirst() == ["--self-test"] {
-            guard runSelfTests() else {
+            guard runSelfTests(), runCommandRunnerSelfTests() else {
                 FileHandle.standardError.write(Data("Self-test failed\n".utf8))
                 exit(1)
             }
@@ -21,21 +21,25 @@ struct VolumeMountTroubleshooterApplication {
                 let snapshot = try scanner.scan { command in
                     print("$ \(command)")
                 }
-                let ioreg = try runner.run(
-                    executable: "/usr/sbin/ioreg",
-                    arguments: ["-p", "IOUSB", "-l", "-w0"],
-                    timeoutSeconds: 15
-                ) { _ in }
                 for disk in snapshot.disks {
                     print("DISK \(disk.identifier) | \(disk.name) | \(disk.busProtocol) | SMART \(disk.smartStatus)")
                     print("SMART_DETAILS \(expandedSMARTSummary(disk.expandedSMART))")
                     if let caveat = expandedSMARTCaveat(disk.expandedSMART) {
                         print("SMART_CAVEAT \(caveat)")
                     }
-                    let speed = usbLinkSpeedBitsPerSecond(from: ioreg.output, productName: disk.name)
-                    print("USB_SPEED \(speed.map(formattedLinkSpeed) ?? "unavailable")")
                     for volume in disk.volumes {
-                        print("VOLUME \(volume.identifier) | \(volume.name) | \(volume.filesystem) | mounted=\(volume.mountPoint != nil) | encrypted=\(volume.isEncrypted) | locked=\(volume.isLocked)")
+                        print("VOLUME \(volume.identifier) | \(volume.name) | \(volume.filesystem) | mounted=\(volume.mountPoint != nil) | \(encryptionStateSummary(volume))")
+                        let transport = try scanner.currentPhysicalTransport(
+                            volume: volume,
+                            disk: disk,
+                            onCommand: { print("$ \($0)") }
+                        )
+                        print(physicalTransportReport(
+                            transport: transport,
+                            selectedIdentifier: volume.identifier,
+                            physicalStoreIdentifiers: volume.physicalStoreIdentifiers,
+                            smartStatus: disk.smartStatus
+                        ))
                     }
                 }
                 for failure in snapshot.scanFailures {

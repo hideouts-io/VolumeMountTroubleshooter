@@ -14,6 +14,9 @@ arm64_binary="$slice_dir/VolumeMountTroubleshooter-arm64"
 x86_64_binary="$slice_dir/VolumeMountTroubleshooter-x86_64"
 source_files=(
   "$project_dir/Diagnostics.swift"
+  "$project_dir/PhysicalTransport.swift"
+  "$project_dir/TransportScanner.swift"
+  "$project_dir/TransportSelfTests.swift"
   "$project_dir/SystemConnectors.swift"
   "$project_dir/AppDelegate.swift"
   "$project_dir/main.swift"
@@ -38,6 +41,7 @@ compile_slice() {
     -target "$architecture-apple-macos13.0" \
     -framework AppKit \
     -framework DiskArbitration \
+    -framework IOKit \
     "${source_files[@]}" \
     -o "$output_path"
 }

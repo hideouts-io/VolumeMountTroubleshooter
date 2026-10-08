@@ -8,12 +8,13 @@ struct CommandResult: Sendable {
 struct ExternalVolume: Hashable, Sendable {
     let identifier: String
     let wholeDiskIdentifier: String
+    let physicalStoreIdentifiers: [String]
     let name: String
     let filesystem: String
     let mountPoint: String?
-    let isEncrypted: Bool
-    let isLocked: Bool
-    let isWritable: Bool
+    let isEncrypted: Bool?
+    let isLocked: Bool?
+    let isWritable: Bool?
     let role: String?
     let size: Int64
 }
@@ -25,6 +26,8 @@ struct ExternalDisk: Hashable, Sendable {
     let busProtocol: String
     let smartStatus: String
     let expandedSMART: ExpandedSMART
+    let mediaIdentity: PhysicalMediaIdentity
+    let physicalTransport: PhysicalTransport
     let size: Int64
     let volumes: [ExternalVolume]
 }
@@ -73,10 +76,10 @@ func volumeActionAvailability(for volume: ExternalVolume?) -> VolumeActionAvaila
     let isMounted = nonEmpty(volume.mountPoint) != nil
     return VolumeActionAvailability(
         inspect: true,
-        mountReadOnly: !volume.isLocked && (!isMounted || volume.isWritable),
-        mountNormally: !volume.isLocked && !isMounted,
+        mountReadOnly: volume.isLocked != true && (!isMounted || volume.isWritable == true),
+        mountNormally: volume.isLocked != true && !isMounted,
         unmountVolume: isMounted,
-        safeEjectDisk: true
+        safeEjectDisk: singleBackingWholeDisk(volume) != nil
     )
 }
 
@@ -151,6 +154,9 @@ struct DiskSnapshot: Sendable {
             }
             let remainingVolumes = disk.volumes.filter { volume in
                 !deviceIdentifier(volume.identifier, isSameAsOrDescendantOf: identifier)
+                    && !volume.physicalStoreIdentifiers.contains { store in
+                        deviceIdentifier(store, isSameAsOrDescendantOf: identifier)
+                    }
             }
             return ExternalDisk(
                 identifier: disk.identifier,
@@ -159,6 +165,8 @@ struct DiskSnapshot: Sendable {
                 busProtocol: disk.busProtocol,
                 smartStatus: disk.smartStatus,
                 expandedSMART: disk.expandedSMART,
+                mediaIdentity: disk.mediaIdentity,
+                physicalTransport: disk.physicalTransport,
                 size: disk.size,
                 volumes: remainingVolumes
             )
@@ -190,6 +198,9 @@ enum TroubleshooterError: LocalizedError {
     case commandTimedOut(command: String, timeoutSeconds: TimeInterval)
     case invalidPropertyList(command: String, reason: String)
     case invalidJSON(command: String, reason: String)
+    case selectedStorageChanged(reason: String)
+    case invalidCommandOutput(command: String, reason: String)
+    case unsupportedStorage(reason: String)
 
     var errorDescription: String? {
         switch self {
@@ -206,6 +217,12 @@ enum TroubleshooterError: LocalizedError {
             return "Could not decode structured output from \(command): \(reason)"
         case let .invalidJSON(command, reason):
             return "Could not decode structured JSON from \(command): \(reason)"
+        case let .selectedStorageChanged(reason):
+            return "The selected storage device changed: \(reason). Refresh the storage inventory and select the device again before continuing."
+        case let .invalidCommandOutput(command, reason):
+            return "Could not read output from \(command): \(reason). Review the command output before continuing."
+        case let .unsupportedStorage(reason):
+            return "This storage mapping is unsupported: \(reason). Use Disk Utility to inspect and manage its backing storage."
         }
     }
 }
@@ -306,6 +323,7 @@ private struct SmartctlDocument: Decodable {
     let powerOnTime: SmartctlPowerOnTime?
     let nvmeHealth: SmartctlNVMeHealth?
     let ataAttributes: SmartctlATAAttributes?
+    let enduranceUsed: SmartctlEnduranceUsed?
 
     enum CodingKeys: String, CodingKey {
         case device
@@ -313,6 +331,7 @@ private struct SmartctlDocument: Decodable {
         case powerOnTime = "power_on_time"
         case nvmeHealth = "nvme_smart_health_information_log"
         case ataAttributes = "ata_smart_attributes"
+        case enduranceUsed = "endurance_used"
     }
 }
 
@@ -330,6 +349,14 @@ private struct SmartctlTemperature: Decodable {
 
 private struct SmartctlPowerOnTime: Decodable {
     let hours: UInt64?
+}
+
+private struct SmartctlEnduranceUsed: Decodable {
+    let currentPercent: Int?
+
+    enum CodingKeys: String, CodingKey {
+        case currentPercent = "current_percent"
+    }
 }
 
 private struct SmartctlNVMeHealth: Decodable {
@@ -371,20 +398,30 @@ struct APFSListPropertyList: Decodable {
 
 struct APFSContainerRecord: Decodable {
     let reference: String
+    let physicalStores: [APFSPhysicalStoreRecord]
     let volumes: [APFSVolumeRecord]
 
     enum CodingKeys: String, CodingKey {
         case reference = "ContainerReference"
+        case physicalStores = "PhysicalStores"
         case volumes = "Volumes"
+    }
+}
+
+struct APFSPhysicalStoreRecord: Decodable {
+    let identifier: String
+
+    enum CodingKeys: String, CodingKey {
+        case identifier = "DeviceIdentifier"
     }
 }
 
 struct APFSVolumeRecord: Decodable {
     let identifier: String
     let name: String
-    let encryption: Bool
-    let fileVault: Bool
-    let locked: Bool
+    let encryption: Bool?
+    let fileVault: Bool?
+    let locked: Bool?
     let roles: [String]
     let capacityInUse: Int64
 
@@ -402,12 +439,84 @@ struct APFSVolumeRecord: Decodable {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         identifier = try container.decode(String.self, forKey: .identifier)
         name = try container.decode(String.self, forKey: .name)
-        encryption = try container.decodeIfPresent(Bool.self, forKey: .encryption) ?? false
-        fileVault = try container.decodeIfPresent(Bool.self, forKey: .fileVault) ?? false
-        locked = try container.decodeIfPresent(Bool.self, forKey: .locked) ?? false
+        encryption = try container.decodeIfPresent(Bool.self, forKey: .encryption)
+        fileVault = try container.decodeIfPresent(Bool.self, forKey: .fileVault)
+        locked = try container.decodeIfPresent(Bool.self, forKey: .locked)
         roles = try container.decodeIfPresent([String].self, forKey: .roles) ?? []
         capacityInUse = try container.decodeIfPresent(Int64.self, forKey: .capacityInUse) ?? 0
     }
+}
+
+/// Missing macOS encryption flags remain unknown; an affirmative flag takes precedence.
+func observedEncryptionState(info: DiskInfoPropertyList, apfsRecord: APFSVolumeRecord?) -> Bool? {
+    let observations: [Bool?] = [info.encryption, info.fileVault, apfsRecord?.encryption, apfsRecord?.fileVault]
+    if observations.contains(true) {
+        return true
+    }
+    return observations.contains(false) ? false : nil
+}
+
+func encryptionStateSummary(_ volume: ExternalVolume) -> String {
+    if volume.isLocked == true {
+        return "encrypted and locked"
+    }
+    switch volume.isEncrypted {
+    case true?:
+        return volume.isLocked == false ? "encrypted and unlocked" : "encrypted; lock state unavailable"
+    case false?:
+        return "not encrypted"
+    case nil:
+        return "unavailable — macOS did not report the volume's encryption state"
+    }
+}
+
+/// A synthesized volume with multiple stores has no single whole disk eligible for ejection.
+func singleBackingWholeDisk(_ volume: ExternalVolume) -> String? {
+    guard volume.physicalStoreIdentifiers.count == 1,
+          let whole = wholeDiskIdentifier(forPhysicalStore: volume.physicalStoreIdentifiers[0]),
+          whole == volume.wholeDiskIdentifier else {
+        return nil
+    }
+    return whole
+}
+
+/// The caller supplies a current selected volume and its revalidated external whole-disk metadata.
+func selectedStorageReport(
+    volume: ExternalVolume,
+    diskInfo: DiskInfoPropertyList,
+    expandedSMART: ExpandedSMART
+) -> String {
+    let mountState = volume.mountPoint.map { "mounted at \($0)" } ?? "not mounted"
+    let writableState: String
+    switch volume.isWritable {
+    case true?: writableState = "writable"
+    case false?: writableState = "read-only"
+    case nil: writableState = "unavailable — macOS did not report the writable state"
+    }
+    let diskSize = (diskInfo.totalSize ?? diskInfo.size).map(formattedByteCount) ?? "size unavailable"
+    let smartState: String
+    if let status = nonEmpty(diskInfo.smartStatus) {
+        smartState = status.caseInsensitiveCompare("Not Supported") == .orderedSame
+            ? "unavailable through this connection (macOS reports Not Supported)"
+            : "\(status) (macOS report; not a guarantee of drive health)"
+    } else {
+        smartState = "unavailable — macOS did not report overall SMART status"
+    }
+    var lines: [String] = [
+        "=== SELECTED STORAGE ===",
+        "Volume: \(volume.name) (/dev/\(volume.identifier))",
+        "Filesystem: \(volume.filesystem)",
+        "Mount: \(mountState)",
+        "Writability: \(writableState)",
+        "macOS encryption: \(encryptionStateSummary(volume))",
+        "Whole disk: /dev/\(diskInfo.identifier) — \(diskSize)",
+        "SMART: \(smartState)",
+        expandedSMARTSummary(expandedSMART)
+    ]
+    if let caveat = expandedSMARTCaveat(expandedSMART) {
+        lines.append(caveat)
+    }
+    return lines.joined(separator: "\n") + "\n\n"
 }
 
 func shellQuoted(_ value: String) -> String {
@@ -450,14 +559,7 @@ func decodeExpandedSMART(
     }
 
     let ataTable = document.ataAttributes?.table ?? []
-    let temperature = document.temperature?.current
-        ?? document.nvmeHealth?.temperature
-        ?? intValue(
-            ataRawValue(
-                names: ["temperaturecelsius", "airflowtemperaturecel", "temperatureinternal"],
-                attributes: ataTable
-            )
-        )
+    let temperature = document.temperature?.current ?? document.nvmeHealth?.temperature
     let mediaErrors = document.nvmeHealth?.mediaErrors
         ?? ataRawValue(
             names: ["mediaanddataintegrityerrors", "reporteduncorrect", "offlineuncorrectable"],
@@ -468,19 +570,32 @@ func decodeExpandedSMART(
             names: ["unsafeshutdowncount", "unexpectedpowerlosscount", "unexpectedpowerloss"],
             attributes: ataTable
         )
-    let powerOnHours = document.powerOnTime?.hours
-        ?? document.nvmeHealth?.powerOnHours
-        ?? ataRawValue(
-            names: ["poweronhours", "poweronhoursandmsec"],
-            attributes: ataTable
-        )
-    let percentageUsed = document.nvmeHealth?.percentageUsed
-        ?? intValue(
-            ataRawValue(
-                names: ["percentageused", "percentlifetimeused", "percentagelifetimeused", "ssdlifeused"],
-                attributes: ataTable
+    let powerOnHours = document.powerOnTime?.hours ?? document.nvmeHealth?.powerOnHours
+    let percentageUsed = document.nvmeHealth?.percentageUsed ?? document.enduranceUsed?.currentPercent
+    let temperatures: [(String, Int?)] = [
+        ("temperature.current", document.temperature?.current),
+        ("nvme_smart_health_information_log.temperature", document.nvmeHealth?.temperature)
+    ]
+    for (field, value) in temperatures {
+        if let value, !(-273...1000).contains(value) {
+            throw TroubleshooterError.invalidJSON(
+                command: command,
+                reason: "\(field) is outside the supported normalized Celsius range -273...1000. Check the collector's output before using its health data."
             )
-        )
+        }
+    }
+    let percentages: [(String, Int?)] = [
+        ("nvme_smart_health_information_log.percentage_used", document.nvmeHealth?.percentageUsed),
+        ("endurance_used.current_percent", document.enduranceUsed?.currentPercent)
+    ]
+    for (field, value) in percentages {
+        if let value, !(0...255).contains(value) {
+            throw TroubleshooterError.invalidJSON(
+                command: command,
+                reason: "\(field) is outside the normalized endurance range 0...255. Check the collector's output before using its health data."
+            )
+        }
+    }
 
     guard
         temperature != nil
@@ -531,7 +646,16 @@ func expandedSMARTSummary(_ expandedSMART: ExpandedSMART) -> String {
         if let percentageUsed = metrics.percentageUsed {
             values.append("Percentage used \(percentageUsed)%")
         }
-        return "Detailed SMART [\(metrics.source.rawValue)]: \(values.joined(separator: " • "))"
+        let missingFields: [(String, Bool)] = [
+            ("temperature", metrics.temperatureCelsius == nil),
+            ("media errors", metrics.mediaErrors == nil),
+            ("unsafe shutdowns", metrics.unsafeShutdowns == nil),
+            ("power-on hours", metrics.powerOnHours == nil),
+            ("endurance", metrics.percentageUsed == nil)
+        ]
+        let missing = missingFields.filter { $0.1 }.map { $0.0 }
+        let coverage = missing.isEmpty ? "" : "\nDetailed SMART unavailable fields: \(missing.joined(separator: ", "))."
+        return "Detailed SMART [\(metrics.source.rawValue)]: \(values.joined(separator: " • "))\(coverage)"
     }
 }
 
@@ -569,13 +693,6 @@ private func normalizedSMARTName(_ value: String) -> String {
     value.lowercased().filter { character in
         character.isLetter || character.isNumber
     }
-}
-
-private func intValue(_ value: UInt64?) -> Int? {
-    guard let value else {
-        return nil
-    }
-    return Int(exactly: value)
 }
 
 private func smartDataSource(protocolName: String?, hasNVMeHealthLog: Bool) -> SMARTDataSource {
@@ -628,27 +745,8 @@ func formattedByteCount(_ byteCount: Int64) -> String {
 
 func volumeMenuTitle(_ volume: ExternalVolume) -> String {
     let mountState = volume.mountPoint == nil ? "Not mounted" : "Mounted"
-    let encryptionState = volume.isLocked ? "Locked" : (volume.isEncrypted ? "Encrypted" : "Not encrypted")
+    let encryptionState = volume.isLocked == true ? "Locked" : (volume.isEncrypted == true ? "Encrypted" : (volume.isEncrypted == false ? "Not encrypted" : "Encryption unavailable"))
     return "\(volume.name) — /dev/\(volume.identifier) — \(volume.filesystem) — \(mountState) — \(encryptionState)"
-}
-
-func usbLinkSpeedBitsPerSecond(from output: String, productName: String) -> Int64? {
-    guard !productName.isEmpty else {
-        return nil
-    }
-    let escapedName = NSRegularExpression.escapedPattern(for: productName)
-    let pattern = "(?s)\\+-o\\s+\(escapedName)@[^\\n]*<class IOUSBHostDevice.*?\\\"UsbLinkSpeed\\\"\\s*=\\s*([0-9]+)"
-    guard let expression = try? NSRegularExpression(pattern: pattern) else {
-        return nil
-    }
-    let range = NSRange(output.startIndex..<output.endIndex, in: output)
-    guard
-        let match = expression.firstMatch(in: output, range: range),
-        let speedRange = Range(match.range(at: 1), in: output)
-    else {
-        return nil
-    }
-    return Int64(output[speedRange])
 }
 
 func formattedLinkSpeed(_ bitsPerSecond: Int64) -> String {
@@ -667,8 +765,11 @@ func guidedFailureExplanation(exitStatus: Int32, output: String, volume: Externa
     let normalized = output.lowercased()
     let prefix = "GUIDED EXPLANATION [exit status \(exitStatus)]: "
 
-    if volume.isLocked || normalized.contains("locked") || normalized.contains("encrypted") {
+    if volume.isLocked == true {
         return prefix + "The volume is encrypted and locked. Unlock it in Finder or Disk Utility, then refresh. This app does not request or store credentials."
+    }
+    if normalized.contains("locked") || normalized.contains("encrypted") {
+        return prefix + "macOS reported an encryption or lock-related failure. Check the selected volume's state in Finder or Disk Utility, then refresh. This app does not request or store credentials."
     }
     if normalized.contains("resource busy") || normalized.contains("in use") {
         return prefix + "macOS reports the volume is busy. Close files and applications using it, then retry. Do not force-eject a busy volume."
@@ -694,11 +795,23 @@ func guidedFailureExplanation(exitStatus: Int32, output: String, volume: Externa
     return prefix + "No specific known signature matched. The exact diskutil output above and recent Disk Arbitration errors below are the authoritative evidence."
 }
 
+/// Removes only the compact log presentation header, preserving every diagnostic line.
+func diskArbitrationLogBody(_ output: String) -> String {
+    let lines = output.split(separator: "\n", omittingEmptySubsequences: false)
+    guard let firstLine = lines.first,
+        firstLine.split(whereSeparator: { $0.isWhitespace }) == ["Timestamp", "Ty", "Process[PID:TID]"]
+    else {
+        return output
+    }
+    return lines.dropFirst().joined(separator: "\n")
+}
+
 func privacyRedactedReport(_ report: String, userName: String) -> String {
     var redacted = report.replacingOccurrences(of: "/Users/\(userName)", with: "/Users/[USER]")
     let replacements: [(String, String)] = [
         (#"(?i)(USB Serial Number|Serial Number|kUSBSerialNumberString)(\"?\s*[:=]\s*\"?)[A-Za-z0-9._-]+"#, "$1$2[REDACTED]"),
         (#"(?i)(sessionID\"?\s*=\s*)[0-9]+"#, "$1[REDACTED]"),
+        (#"(?i)((?:registryID|locationID)=)0x[0-9a-f]+"#, "$1[REDACTED]"),
         (#"(?i)(UID|Domain UUID|Disk UUID|Volume UUID)(:\s*)[^\s]+"#, "$1$2[REDACTED]"),
         (#"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}"#, "[UUID]")
     ]
@@ -718,6 +831,16 @@ func privacyRedactedReport(_ report: String, userName: String) -> String {
 }
 
 func runSelfTests() -> Bool {
+    let logHeader = "Timestamp               Ty Process[PID:TID]\n"
+    let logEntry = "2026-10-07 18:00:00.000 E diskarbitrationd[123:456] disk4s1: mount denied\n"
+    let logWarning = "log: selected-storage log access denied\n"
+    guard diskArbitrationLogBody(logHeader).isEmpty,
+        diskArbitrationLogBody(logHeader + logEntry) == logEntry,
+        diskArbitrationLogBody(logWarning) == logWarning,
+        diskArbitrationLogBody("").isEmpty
+    else {
+        return false
+    }
     let diskListXML = """
     <?xml version="1.0" encoding="UTF-8"?>
     <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -783,6 +906,7 @@ func runSelfTests() -> Bool {
     let testVolume = ExternalVolume(
         identifier: "disk4s1",
         wholeDiskIdentifier: "disk4",
+        physicalStoreIdentifiers: ["disk4"],
         name: "Extreme SSD",
         filesystem: "ExFAT",
         mountPoint: "/Volumes/Extreme SSD",
@@ -795,6 +919,7 @@ func runSelfTests() -> Bool {
     let unmountedVolume = ExternalVolume(
         identifier: "disk6s1",
         wholeDiskIdentifier: "disk6",
+        physicalStoreIdentifiers: ["disk6s2"],
         name: "Unmounted Test",
         filesystem: "APFS",
         mountPoint: nil,
@@ -807,6 +932,7 @@ func runSelfTests() -> Bool {
     let lockedVolume = ExternalVolume(
         identifier: "disk7s1",
         wholeDiskIdentifier: "disk7",
+        physicalStoreIdentifiers: ["disk7s2"],
         name: "Locked Test",
         filesystem: "APFS",
         mountPoint: nil,
@@ -835,11 +961,14 @@ func runSelfTests() -> Bool {
       "device": { "protocol": "ATA" },
       "temperature": { "current": 35 },
       "power_on_time": { "hours": 567 },
+      "endurance_used": { "current_percent": 8 },
       "ata_smart_attributes": {
         "table": [
           { "name": "Reported_Uncorrect", "raw": { "value": 4 } },
           { "name": "Unsafe_Shutdown_Count", "raw": { "value": 6 } },
-          { "name": "Percentage_Used", "raw": { "value": 8 } }
+          { "name": "Percentage_Used", "raw": { "value": 999 } },
+          { "name": "Temperature_Celsius", "raw": { "value": 433794777123 } },
+          { "name": "Power_On_Hours_and_Msec", "raw": { "value": 257698037760123 } }
         ]
       }
     }
@@ -890,6 +1019,8 @@ func runSelfTests() -> Bool {
                 busProtocol: "USB",
                 smartStatus: "Verified",
                 expandedSMART: nvmeExpandedSMART ?? .unavailable(reason: "self-test decode failed"),
+                mediaIdentity: .unavailable(reason: "self-test has no hardware observations"),
+                physicalTransport: .unavailable(reason: "self-test has no hardware observations"),
                 size: 2_000_000_000_000,
                 volumes: [testVolume]
             )
@@ -1015,12 +1146,118 @@ func runSelfTests() -> Bool {
         return false
     }
 
-    let ioreg = #"+-o Drive@1 <class IOUSBHostDevice, id 1> { "UsbLinkSpeed" = 10000000000 }"#
-    guard usbLinkSpeedBitsPerSecond(from: ioreg, productName: "Drive") == 10_000_000_000 else {
-        return false
-    }
-
     let report = "USB Serial Number: ABC123\nVolume UUID: 12345678-1234-1234-1234-123456789ABC"
     let redacted = privacyRedactedReport(report, userName: "tester")
     return !redacted.contains("ABC123") && !redacted.contains("12345678-1234")
+        && runTransportSelfTests() && runStorageObservationSelfTests()
+}
+
+private func runStorageObservationSelfTests() -> Bool {
+    let missingInfoXML = """
+    <plist version="1.0"><dict><key>DeviceIdentifier</key><string>disk4</string></dict></plist>
+    """
+    let unencryptedInfoXML = """
+    <plist version="1.0"><dict><key>DeviceIdentifier</key><string>disk4</string><key>FileVault</key><false/></dict></plist>
+    """
+    let missingAPFSXML = """
+    <plist version="1.0"><dict><key>DeviceIdentifier</key><string>disk8s1</string><key>Name</key><string>Selected APFS volume</string></dict></plist>
+    """
+    let encryptedAPFSXML = """
+    <plist version="1.0"><dict><key>DeviceIdentifier</key><string>disk8s1</string><key>Name</key><string>Selected APFS volume</string><key>Encryption</key><true/></dict></plist>
+    """
+    guard let missingInfo = try? decodePropertyList(DiskInfoPropertyList.self, output: missingInfoXML, command: "missing observations self-test"),
+          let unencryptedInfo = try? decodePropertyList(DiskInfoPropertyList.self, output: unencryptedInfoXML, command: "encryption observation self-test"),
+          let missingAPFS = try? decodePropertyList(APFSVolumeRecord.self, output: missingAPFSXML, command: "missing APFS observations self-test"),
+          let encryptedAPFS = try? decodePropertyList(APFSVolumeRecord.self, output: encryptedAPFSXML, command: "APFS encryption observation self-test"),
+          missingAPFS.encryption == nil, missingAPFS.fileVault == nil, missingAPFS.locked == nil,
+          observedEncryptionState(info: missingInfo, apfsRecord: missingAPFS) == nil,
+          observedEncryptionState(info: unencryptedInfo, apfsRecord: nil) == false,
+          observedEncryptionState(info: unencryptedInfo, apfsRecord: encryptedAPFS) == true else {
+        return false
+    }
+    let unknownVolume = ExternalVolume(
+        identifier: "disk8s1", wholeDiskIdentifier: "disk4", physicalStoreIdentifiers: ["disk4s2"],
+        name: "Selected APFS volume", filesystem: "APFS", mountPoint: "/Volumes/Selected APFS volume",
+        isEncrypted: nil, isLocked: nil, isWritable: nil, role: nil, size: 1000
+    )
+    guard singleBackingWholeDisk(unknownVolume) == "disk4",
+          encryptionStateSummary(unknownVolume).contains("unavailable"),
+          !volumeActionAvailability(for: unknownVolume).mountReadOnly else {
+        return false
+    }
+    for stores in [[], ["disk40s2"], ["disk4s2", "disk6s2"], ["disk4s2", "disk4s2"]] {
+        let ambiguousVolume = ExternalVolume(
+            identifier: unknownVolume.identifier, wholeDiskIdentifier: unknownVolume.wholeDiskIdentifier,
+            physicalStoreIdentifiers: stores, name: unknownVolume.name, filesystem: unknownVolume.filesystem,
+            mountPoint: unknownVolume.mountPoint, isEncrypted: nil, isLocked: nil, isWritable: nil,
+            role: nil, size: unknownVolume.size
+        )
+        guard singleBackingWholeDisk(ambiguousVolume) == nil,
+              !volumeActionAvailability(for: ambiguousVolume).safeEjectDisk else {
+            return false
+        }
+    }
+    let apfsSnapshot = DiskSnapshot(
+        disks: [ExternalDisk(
+            identifier: "disk4", name: "Selected physical disk", deviceTreePath: nil,
+            busProtocol: "USB", smartStatus: "Unavailable", expandedSMART: .unavailable(reason: "synthetic observation"),
+            mediaIdentity: .unavailable(reason: "synthetic observation"),
+            physicalTransport: .unavailable(reason: "synthetic observation"), size: 1000, volumes: [unknownVolume]
+        )], unlockers: [], scanFailures: []
+    )
+    guard apfsSnapshot.removingDevice(identifier: "disk4s2").volumes.isEmpty,
+          apfsSnapshot.removingDevice(identifier: "disk4").volumes.isEmpty,
+          apfsSnapshot.removingDevice(identifier: "disk8").volumes.isEmpty,
+          apfsSnapshot.removingDevice(identifier: "disk40").volumes == [unknownVolume] else {
+        return false
+    }
+    let unknownReport = selectedStorageReport(
+        volume: unknownVolume, diskInfo: missingInfo,
+        expandedSMART: .unavailable(reason: "the collector is not installed")
+    )
+    guard unknownReport.contains("size unavailable"),
+          unknownReport.contains("macOS did not report the writable state"),
+          unknownReport.contains("macOS did not report overall SMART status"),
+          !unknownReport.contains("UUID"), !unknownReport.contains("registryID") else {
+        return false
+    }
+    let packedATAJSON = """
+    {"device":{"protocol":"ATA"},"ata_smart_attributes":{"table":[
+      {"name":"Temperature_Celsius","raw":{"value":433794777123}},
+      {"name":"Power_On_Hours_and_Msec","raw":{"value":257698037760123}},
+      {"name":"Percentage_Used","raw":{"value":999}}
+    ]}}
+    """
+    guard let packedSMART = try? decodeExpandedSMART(
+        output: packedATAJSON, command: "packed ATA self-test", collector: "self-test", exitStatus: 0
+    ), case .unavailable = packedSMART else {
+        return false
+    }
+    let invalidMetrics: [(String, String)] = [
+        (#"{"temperature":{"current":-274}}"#, "temperature.current"),
+        (#"{"temperature":{"current":1001}}"#, "temperature.current"),
+        (#"{"temperature":{"current":41},"nvme_smart_health_information_log":{"temperature":1001}}"#, "nvme_smart_health_information_log.temperature"),
+        (#"{"nvme_smart_health_information_log":{"percentage_used":-1}}"#, "nvme_smart_health_information_log.percentage_used"),
+        (#"{"nvme_smart_health_information_log":{"percentage_used":256}}"#, "nvme_smart_health_information_log.percentage_used"),
+        (#"{"endurance_used":{"current_percent":256}}"#, "endurance_used.current_percent")
+    ]
+    for (output, field) in invalidMetrics {
+        do {
+            _ = try decodeExpandedSMART(output: output, command: "invalid normalized metric self-test", collector: "self-test", exitStatus: 0)
+            return false
+        } catch let error as TroubleshooterError {
+            guard case let .invalidJSON(_, reason) = error, reason.contains(field) else {
+                return false
+            }
+        } catch {
+            return false
+        }
+    }
+    guard let exceededEndurance = try? decodeExpandedSMART(
+        output: #"{"nvme_smart_health_information_log":{"percentage_used":255}}"#,
+        command: "exceeded endurance self-test", collector: "self-test", exitStatus: 0
+    ), case let .reported(metrics) = exceededEndurance, metrics.percentageUsed == 255 else {
+        return false
+    }
+    return true
 }
