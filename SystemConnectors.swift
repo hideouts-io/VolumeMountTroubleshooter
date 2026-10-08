@@ -5,18 +5,38 @@ import Foundation
 private final class CommandOutputBuffer: @unchecked Sendable {
     private let lock = NSLock()
     private var output = ""
+    private var trailingBytes = Data()
+    private var decodingFailure: String?
 
-    func append(_ text: String) {
+    func append(_ data: Data) -> String {
         lock.lock()
-        output.append(text)
-        lock.unlock()
+        defer { lock.unlock() }
+        guard decodingFailure == nil else { return "" }
+        let bytes = trailingBytes + data
+        for retainedCount in 0...min(3, bytes.count) {
+            if let text = String(data: bytes.dropLast(retainedCount), encoding: .utf8) {
+                trailingBytes = Data(bytes.suffix(retainedCount))
+                output.append(text)
+                return text
+            }
+        }
+        decodingFailure = "the command emitted invalid UTF-8; its output cannot be displayed reliably"
+        return ""
     }
 
-    func value() -> String {
+    func value(command: String) throws -> String {
         lock.lock()
-        let result = output
-        lock.unlock()
-        return result
+        defer { lock.unlock() }
+        if let decodingFailure {
+            throw TroubleshooterError.invalidCommandOutput(command: command, reason: decodingFailure)
+        }
+        guard trailingBytes.isEmpty else {
+            throw TroubleshooterError.invalidCommandOutput(
+                command: command,
+                reason: "the command ended with an incomplete or invalid UTF-8 character"
+            )
+        }
+        return output
     }
 }
 
@@ -59,10 +79,6 @@ final class CommandRunner: @unchecked Sendable {
         process.standardOutput = outputPipe
         process.standardError = outputPipe
 
-        lock.lock()
-        currentProcess = process
-        lock.unlock()
-
         defer {
             lock.lock()
             currentProcess = nil
@@ -74,9 +90,17 @@ final class CommandRunner: @unchecked Sendable {
             processFinished.signal()
         }
 
+        lock.lock()
+        guard !cancellationRequested else {
+            lock.unlock()
+            throw TroubleshooterError.cancelled
+        }
         do {
             try process.run()
+            currentProcess = process
+            lock.unlock()
         } catch {
+            lock.unlock()
             throw TroubleshooterError.commandLaunchFailed(
                 executable: executable,
                 reason: error.localizedDescription
@@ -96,9 +120,10 @@ final class CommandRunner: @unchecked Sendable {
                 if data.isEmpty {
                     break
                 }
-                let chunk = String(decoding: data, as: UTF8.self)
-                outputBuffer.append(chunk)
-                onOutput(chunk)
+                let chunk = outputBuffer.append(data)
+                if !chunk.isEmpty {
+                    onOutput(chunk)
+                }
             }
         }
 
@@ -121,13 +146,108 @@ final class CommandRunner: @unchecked Sendable {
                 timeoutSeconds: timeoutSeconds
             )
         }
-        return CommandResult(exitStatus: process.terminationStatus, output: outputBuffer.value())
+        return CommandResult(
+            exitStatus: process.terminationStatus,
+            output: try outputBuffer.value(command: renderedCommand(executable: executable, arguments: arguments))
+        )
+    }
+}
+
+/// Exercises actual pipe boundaries, command failure output and cancellation without touching storage devices.
+func runCommandRunnerSelfTests() -> Bool {
+    let fileManager = FileManager.default
+    let directory = fileManager.temporaryDirectory.appendingPathComponent("volume-report-stream-\(UUID().uuidString)", isDirectory: true)
+    do {
+        try fileManager.createDirectory(at: directory, withIntermediateDirectories: false)
+        let readyFile = directory.appendingPathComponent("reader-ready")
+        let streamed = CommandOutputBuffer()
+        let runner = CommandRunner()
+        let result = try runner.run(
+            executable: "/bin/sh",
+            arguments: [
+                "-c",
+                #"printf 'prefix:\342'; while [ ! -e "$1" ]; do /bin/sleep 0.01; done; printf '\202\254 \360\237\222\276\n'"#,
+                "stream-test",
+                readyFile.path
+            ],
+            timeoutSeconds: 5
+        ) { chunk in
+            _ = streamed.append(Data(chunk.utf8))
+            if chunk == "prefix:" {
+                if !fileManager.createFile(atPath: readyFile.path, contents: Data()) {
+                    FileHandle.standardError.write(Data("Could not create the task-owned pipe-test handshake file\n".utf8))
+                }
+            }
+        }
+        let streamedText = try streamed.value(command: "native pipe self-test")
+        guard result.exitStatus == 0, result.output == "prefix:€ 💾\n", streamedText == result.output else {
+            try fileManager.removeItem(at: directory)
+            return false
+        }
+        let failure = try runner.run(
+            executable: "/bin/sh",
+            arguments: ["-c", "printf 'specific command failure\\n'; exit 7"],
+            timeoutSeconds: 5
+        ) { _ in }
+        guard failure.exitStatus == 7, failure.output == "specific command failure\n" else {
+            try fileManager.removeItem(at: directory)
+            return false
+        }
+        do {
+            _ = try runner.run(
+                executable: "/bin/sh",
+                arguments: ["-c", #"printf '\377'"#],
+                timeoutSeconds: 5
+            ) { _ in }
+            try fileManager.removeItem(at: directory)
+            return false
+        } catch TroubleshooterError.invalidCommandOutput {
+        }
+        runner.cancel()
+        let forbiddenFile = directory.appendingPathComponent("cancelled-command-launched")
+        do {
+            _ = try runner.run(
+                executable: "/usr/bin/touch",
+                arguments: [forbiddenFile.path],
+                timeoutSeconds: 5
+            ) { _ in }
+            try fileManager.removeItem(at: directory)
+            return false
+        } catch TroubleshooterError.cancelled {
+            guard !fileManager.fileExists(atPath: forbiddenFile.path) else {
+                try fileManager.removeItem(at: directory)
+                return false
+            }
+        }
+        try fileManager.removeItem(at: directory)
+        return true
+    } catch {
+        FileHandle.standardError.write(Data("Command integration self-test failed: \(error.localizedDescription)\n".utf8))
+        if fileManager.fileExists(atPath: directory.path) {
+            do {
+                try fileManager.removeItem(at: directory)
+            } catch {
+                FileHandle.standardError.write(Data("Could not remove task-owned command-test directory: \(error.localizedDescription)\n".utf8))
+            }
+        }
+        return false
     }
 }
 
 enum ScannedExternalDisk: Sendable {
     case disk(ExternalDisk)
     case unlocker(VirtualUnlocker)
+}
+
+struct SelectedStorageState {
+    let volume: ExternalVolume
+    let wholeDiskInfo: DiskInfoPropertyList
+}
+
+struct SelectedStorageEvidence {
+    let state: SelectedStorageState
+    let transport: PhysicalTransport
+    let expandedSMART: ExpandedSMART
 }
 
 func externalDiskSnapshot(
@@ -239,7 +359,7 @@ final class DiskScanner: @unchecked Sendable {
             )
         }
 
-        for partition in entry.partitions {
+        for partition in flattenedPartitions(entry.partitions) {
             let partitionInfo = try diskInfo(identifier: partition.identifier, onCommand: onCommand)
             guard partitionInfo.parentWholeDisk == entry.identifier else {
                 throw TroubleshooterError.invalidPropertyList(
@@ -338,54 +458,97 @@ final class DiskScanner: @unchecked Sendable {
         }
     }
 
-    /// Revalidates the selected volume's backing store before publishing a fresh transport report.
+    /// Requires the captured media identity and current backing-store mapping to agree before using disk numbers.
+    func validatedSelectedStorage(
+        volume: ExternalVolume,
+        disk: ExternalDisk,
+        onCommand: @escaping (String) -> Void
+    ) throws -> SelectedStorageState {
+        try validateCapturedMediaIdentity(disk: disk)
+        let selectedInfo = try diskInfo(identifier: volume.identifier, onCommand: onCommand)
+        guard selectedInfo.identifier == volume.identifier else {
+            throw TroubleshooterError.selectedStorageChanged(reason: "diskutil returned a different selected volume")
+        }
+        let currentStores: [String]
+        let apfsRecord: APFSVolumeRecord?
+        if let reference = nonEmpty(selectedInfo.apfsContainerReference) {
+            let container = try apfsContainer(reference: reference, onCommand: onCommand)
+            let matchingVolumes = container.volumes.filter { $0.identifier == volume.identifier }
+            guard matchingVolumes.count == 1, let record = matchingVolumes.first else {
+                throw TroubleshooterError.selectedStorageChanged(reason: "the selected APFS volume is absent or duplicated in its current container")
+            }
+            currentStores = container.physicalStores.map(\.identifier)
+            apfsRecord = record
+        } else if let whole = nonEmpty(selectedInfo.parentWholeDisk) {
+            currentStores = [whole]
+            apfsRecord = nil
+        } else {
+            throw TroubleshooterError.selectedStorageChanged(reason: "diskutil did not expose the selected volume's parent whole disk")
+        }
+        guard currentStores.count == 1 else {
+            throw TroubleshooterError.unsupportedStorage(reason: "the selected APFS volume spans multiple physical stores; no single disk or path can be attributed")
+        }
+        guard Set(currentStores) == Set(volume.physicalStoreIdentifiers),
+            singleBackingWholeDisk(volume) == disk.identifier
+        else {
+            throw TroubleshooterError.selectedStorageChanged(reason: "the selected volume's physical-store mapping changed")
+        }
+        let storeInfo = try diskInfo(identifier: currentStores[0], onCommand: onCommand)
+        guard storeInfo.parentWholeDisk == disk.identifier else {
+            throw TroubleshooterError.selectedStorageChanged(reason: "the selected physical store no longer belongs to /dev/\(disk.identifier)")
+        }
+        let wholeInfo = currentStores[0] == disk.identifier
+            ? storeInfo
+            : try diskInfo(identifier: disk.identifier, onCommand: onCommand)
+        guard wholeInfo.identifier == disk.identifier, wholeInfo.deviceTreePath == disk.deviceTreePath else {
+            throw TroubleshooterError.selectedStorageChanged(reason: "the selected physical disk's identity or physical path changed")
+        }
+        try validateCapturedMediaIdentity(disk: disk)
+        return SelectedStorageState(
+            volume: externalVolume(
+                info: selectedInfo,
+                wholeDiskIdentifier: disk.identifier,
+                fallbackName: volume.identifier,
+                fallbackSize: 0,
+                physicalStoreIdentifiers: currentStores,
+                apfsRecord: apfsRecord
+            ),
+            wholeDiskInfo: wholeInfo
+        )
+    }
+
+    private func validateCapturedMediaIdentity(disk: ExternalDisk) throws {
+        guard case let .observed(expectedID) = disk.mediaIdentity else {
+            throw TroubleshooterError.selectedStorageChanged(reason: "no exact block-media identity was captured when this disk was selected")
+        }
+        do {
+            try verifyMediaContinuity(identifier: disk.identifier, expectedRegistryEntryID: expectedID)
+        } catch let error as TransportScanError {
+            throw TroubleshooterError.selectedStorageChanged(reason: error.localizedDescription)
+        }
+    }
+
     func currentPhysicalTransport(
         volume: ExternalVolume,
         disk: ExternalDisk,
         onCommand: @escaping (String) -> Void
     ) throws -> PhysicalTransport {
-        guard case let .observed(expectedID) = disk.mediaIdentity else {
-            return .unavailable(reason: "No exact block-media identity was captured when this disk was selected. Refresh and select it again; continuity cannot be inferred from disk numbers or a shared port.")
-        }
-        do {
-            try verifyMediaContinuity(identifier: disk.identifier, expectedRegistryEntryID: expectedID)
-        } catch let error as TransportScanError {
-            return .unavailable(reason: error.localizedDescription)
-        }
-        let selectedInfo = try diskInfo(identifier: volume.identifier, onCommand: onCommand)
-        guard selectedInfo.identifier == volume.identifier else {
-            return .unavailable(reason: "diskutil returned a different selected volume. Refresh the storage inventory.")
-        }
-        let currentStores: [String]
-        if let reference = nonEmpty(selectedInfo.apfsContainerReference) {
-            let container = try apfsContainer(reference: reference, onCommand: onCommand)
-            guard container.volumes.contains(where: { $0.identifier == volume.identifier }) else {
-                return .unavailable(reason: "The selected APFS volume is absent from its current container. Refresh the storage inventory.")
-            }
-            currentStores = container.physicalStores.map(\.identifier)
-        } else if let whole = nonEmpty(selectedInfo.parentWholeDisk) {
-            currentStores = [whole]
-        } else {
-            return .unavailable(reason: "diskutil did not expose the selected volume's parent whole disk. No physical association was guessed.")
-        }
-        guard currentStores == volume.physicalStoreIdentifiers, currentStores.count == 1 else {
-            return .unavailable(reason: "The selected volume's physical-store mapping is changed or has multiple stores. Refresh; no single path was attributed to it.")
-        }
-        let storeInfo = try diskInfo(identifier: currentStores[0], onCommand: onCommand)
-        guard storeInfo.parentWholeDisk == disk.identifier else {
-            return .unavailable(reason: "The selected physical store no longer belongs to /dev/\(disk.identifier). Refresh the storage inventory.")
-        }
-        let wholeInfo = try diskInfo(identifier: disk.identifier, onCommand: onCommand)
-        guard wholeInfo.identifier == disk.identifier, wholeInfo.deviceTreePath == disk.deviceTreePath else {
-            return .unavailable(reason: "The selected physical disk's identity or DeviceTreePath changed. Refresh before inspecting its connection.")
-        }
-        let transport = try collectPhysicalTransport(info: wholeInfo, onCommand: onCommand)
-        do {
-            try verifyMediaContinuity(identifier: disk.identifier, expectedRegistryEntryID: expectedID)
-        } catch let error as TransportScanError {
-            return .unavailable(reason: error.localizedDescription)
-        }
+        let state = try validatedSelectedStorage(volume: volume, disk: disk, onCommand: onCommand)
+        let transport = try collectPhysicalTransport(info: state.wholeDiskInfo, onCommand: onCommand)
+        try validateCapturedMediaIdentity(disk: disk)
         return transport
+    }
+
+    func currentSelectedStorageEvidence(
+        volume: ExternalVolume,
+        disk: ExternalDisk,
+        onCommand: @escaping (String) -> Void
+    ) throws -> SelectedStorageEvidence {
+        let state = try validatedSelectedStorage(volume: volume, disk: disk, onCommand: onCommand)
+        let transport = try collectPhysicalTransport(info: state.wholeDiskInfo, onCommand: onCommand)
+        let expandedSMART = try collectExpandedSMART(identifier: disk.identifier, onCommand: onCommand)
+        try validateCapturedMediaIdentity(disk: disk)
+        return SelectedStorageEvidence(state: state, transport: transport, expandedSMART: expandedSMART)
     }
 
     private func collectExpandedSMART(
@@ -484,6 +647,11 @@ final class DiskScanner: @unchecked Sendable {
                 reason: "the scanned partition is absent from this container's physical stores"
             )
         }
+        guard container.physicalStores.count == 1 else {
+            throw TroubleshooterError.unsupportedStorage(
+                reason: "APFS container /dev/\(containerReference) spans multiple physical stores; selecting one backing disk would be ambiguous"
+            )
+        }
         return try container.volumes.filter(isUserFacingAPFSVolume).map { record in
             let info = try diskInfo(identifier: record.identifier, onCommand: onCommand)
             return externalVolume(
@@ -554,9 +722,9 @@ final class DiskScanner: @unchecked Sendable {
             name: nonEmpty(info.volumeName) ?? nonEmpty(apfsRecord?.name) ?? fallbackName,
             filesystem: nonEmpty(info.filesystemName) ?? nonEmpty(info.filesystemType) ?? "Unknown",
             mountPoint: nonEmpty(info.mountPoint),
-            isEncrypted: (apfsRecord?.encryption ?? false) || (apfsRecord?.fileVault ?? false) || (info.encryption ?? false) || (info.fileVault ?? false),
-            isLocked: (apfsRecord?.locked ?? false) || (info.locked ?? false),
-            isWritable: info.writableVolume ?? false,
+            isEncrypted: observedEncryptionState(info: info, apfsRecord: apfsRecord),
+            isLocked: apfsRecord?.locked ?? info.locked,
+            isWritable: info.writableVolume,
             role: nonEmpty(roles),
             size: info.totalSize ?? info.size ?? fallbackSize
         )
@@ -575,6 +743,7 @@ final class DiskScanner: @unchecked Sendable {
             arguments: arguments,
             timeoutSeconds: timeoutSeconds
         ) { _ in }
+        onCommand("[exit status: \(result.exitStatus)]")
         guard result.exitStatus == 0 else {
             throw TroubleshooterError.commandFailed(
                 command: command,

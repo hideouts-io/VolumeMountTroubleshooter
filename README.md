@@ -368,7 +368,7 @@ An encrypted and unlocked volume may be mounted normally or read-only like any o
 
 ### Selected physical connection
 
-The connection display traces the selected storage device from its current whole-disk `IOMedia` BSD name upward through the IOService registry. Reports show a readable controller, port, hub and storage-device path, negotiated speed, storage protocol and concise coverage limits. Internal registry/location IDs, driver classes and descriptor codes are omitted from both the display and reports. Product names never establish disk identity. `diskutil` remains authoritative for storage inventory; APFS physical-store records associate synthesized volumes with physical disks. Multiple physical stores or registry parents produce explicit unresolved coverage rather than a guessed single connection.
+The connection display traces the selected storage device from its current whole-disk `IOMedia` BSD name upward through the IOService registry. Reports show a readable controller, port, hub and storage-device path, negotiated speed, storage protocol and concise coverage limits. Internal registry/location IDs, driver classes and descriptor codes are omitted from both the display and reports. Product names never establish disk identity. `diskutil` remains authoritative for storage inventory; APFS physical-store records associate synthesized volumes with physical disks. Multi-store APFS containers produce an explicit unsupported-mapping failure and no selectable target; ambiguous registry parents produce unresolved transport coverage. Every storage action revalidates the captured media identity and backing-store mapping before using a current disk number.
 
 Inspect revalidates the selected volume's backing store, device-tree ancestry and current media registry ID. Disk numbers and registry IDs are transient; a replaced media service requires refreshing and selecting the device again. Transport observations are also refreshed with the existing Disk Arbitration inventory flow.
 
@@ -396,7 +396,7 @@ When the device and bridge expose them, the app displays:
 - power-on hours; and
 - percentage used.
 
-NVMe values come from the controller's SMART/Health Information log. The smartmontools implementation maps those counters to structured JSON fields such as `temperature.current`, `power_on_time.hours`, `percentage_used`, `unsafe_shutdowns`, and `media_errors`. ATA attribute names and raw values are vendor-specific, so the app recognizes only a conservative set of common names and labels them with a vendor-data caveat. [smartctl JSON implementation](https://www.smartmontools.org/static/doxygen/smartctl_8cpp_source.html), [NVMe JSON field mapping](https://www.smartmontools.org/static/doxygen/nvmeprint_8cpp_source.html)
+NVMe values come from the controller's SMART/Health Information log. Temperature, power-on hours and endurance use normalized structured fields such as `temperature.current`, `power_on_time.hours`, and `endurance_used.current_percent`, or the corresponding NVMe fields. Packed ATA raw attributes are never interpreted as Celsius, hours or percentages. Only retained error/shutdown counters use conservative vendor attribute names, with an explicit vendor-data caveat. [ATA JSON field mapping](https://github.com/smartmontools/smartmontools/blob/master/smartmontools/ataprint.cpp), [NVMe JSON field mapping](https://www.smartmontools.org/static/doxygen/nvmeprint_8cpp_source.html)
 
 Missing data is shown as unavailable, never as zero. A bridge may suppress, cache, translate, or mislabel drive data; percentage used is not the same as percentage remaining and may exceed 100 on an over-endurance NVMe device. These counters are evidence reported through the current drive/bridge path, not an independent health verdict.
 
@@ -445,9 +445,7 @@ The application constructs commands only from fixed absolute executable paths, f
 
 | Purpose | Command |
 |---|---|
-| External disk display | `/usr/sbin/diskutil list external physical` |
 | Typed external disk inventory | `/usr/sbin/diskutil list -plist external physical` |
-| Disk or volume details | `/usr/sbin/diskutil info /dev/diskN` |
 | Typed disk or volume details | `/usr/sbin/diskutil info -plist /dev/diskNsN` |
 | Typed APFS inventory | `/usr/sbin/diskutil apfs list -plist /dev/diskN` |
 | Optional expanded SMART JSON | `<known smartctl path> --all --json /dev/diskN` |
@@ -532,6 +530,8 @@ Command-launch failures, malformed property lists, missing required fields, canc
 - UUID-shaped values elsewhere in the report.
 
 Redaction applies to the copied or saved report. The live console remains diagnostic evidence and may still contain volume names, mount points, device identifiers, filenames emitted by macOS, and log metadata. Review every report before sharing it.
+
+Inspect renders fresh selected-volume and whole-disk observations as a compact summary, with unknown encryption, writability and SMART fields stated explicitly. It omits raw UUID fields and unrelated disk listings while retaining executed commands, exit statuses and failure output. Disk Arbitration log queries match the selected volume or its physical disk by a complete BSD identifier; entries without those identifiers remain outside correlated log coverage.
 
 Disabling report redaction is an explicit user choice. Reports are written only to the destination selected in the standard macOS save panel.
 

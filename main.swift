@@ -6,7 +6,7 @@ struct VolumeMountTroubleshooterApplication {
     @MainActor
     static func main() {
         if CommandLine.arguments.dropFirst() == ["--self-test"] {
-            guard runSelfTests() else {
+            guard runSelfTests(), runCommandRunnerSelfTests() else {
                 FileHandle.standardError.write(Data("Self-test failed\n".utf8))
                 exit(1)
             }
@@ -28,7 +28,7 @@ struct VolumeMountTroubleshooterApplication {
                         print("SMART_CAVEAT \(caveat)")
                     }
                     for volume in disk.volumes {
-                        print("VOLUME \(volume.identifier) | \(volume.name) | \(volume.filesystem) | mounted=\(volume.mountPoint != nil) | encrypted=\(volume.isEncrypted) | locked=\(volume.isLocked)")
+                        print("VOLUME \(volume.identifier) | \(volume.name) | \(volume.filesystem) | mounted=\(volume.mountPoint != nil) | \(encryptionStateSummary(volume))")
                         let transport = try scanner.currentPhysicalTransport(
                             volume: volume,
                             disk: disk,
