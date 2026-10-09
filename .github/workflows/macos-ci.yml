@@ -19,7 +19,7 @@ jobs:
 
     steps:
       - name: Check out source
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
 
@@ -47,7 +47,7 @@ jobs:
             -verify_arch x86_64
 
       - name: Upload universal release files
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: VolumeMountTroubleshooter-macOS-universal-${{ github.sha }}
           path: |
@@ -63,12 +63,12 @@ jobs:
 
     steps:
       - name: Check out verification script
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
 
       - name: Download universal release files
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: VolumeMountTroubleshooter-macOS-universal-${{ github.sha }}
           path: dist
@@ -82,6 +82,7 @@ jobs:
 
   publish-release:
     name: Publish verified tagged release
+    environment: github-release
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     needs: [build-universal, verify-intel]
     runs-on: ubuntu-latest
@@ -90,7 +91,7 @@ jobs:
 
     steps:
       - name: Download verified release files
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: VolumeMountTroubleshooter-macOS-universal-${{ github.sha }}
           path: dist
