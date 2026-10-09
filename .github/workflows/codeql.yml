@@ -1,0 +1,136 @@
+name: CodeQL
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: "37 8 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: codeql-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  swift:
+    name: Analyze Swift
+    runs-on: macos-15
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: github/codeql-action/init@24c54180a607b1449ed407dd24f251e4e9147c8d # v4
+        with:
+          languages: swift
+          build-mode: manual
+      - name: Compile native application
+        run: ./build.sh
+      - uses: github/codeql-action/analyze@24c54180a607b1449ed407dd24f251e4e9147c8d # v4
+        with:
+          upload: never
+          upload-database: false
+          output: ${{ runner.temp }}/codeql-sarif
+          category: /language:swift
+      - name: Upload SARIF artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: codeql-swift
+          path: ${{ runner.temp }}/codeql-sarif
+          if-no-files-found: error
+          retention-days: 1
+
+  actions:
+    name: Analyze Actions
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: github/codeql-action/init@24c54180a607b1449ed407dd24f251e4e9147c8d # v4
+        with:
+          languages: actions
+          build-mode: none
+      - uses: github/codeql-action/analyze@24c54180a607b1449ed407dd24f251e4e9147c8d # v4
+        with:
+          upload: never
+          upload-database: false
+          output: ${{ runner.temp }}/codeql-sarif
+          category: /language:actions
+      - name: Upload SARIF artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: codeql-actions
+          path: ${{ runner.temp }}/codeql-sarif
+          if-no-files-found: error
+          retention-days: 1
+
+  upload-swift:
+    name: Upload Swift analysis
+    needs: swift
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Download SARIF artifact
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: codeql-swift
+          path: sarif
+      - name: Upload analysis to code scanning
+        uses: github/codeql-action/upload-sarif@24c54180a607b1449ed407dd24f251e4e9147c8d # v4
+        with:
+          sarif_file: sarif
+          category: /language:swift
+          wait-for-processing: true
+
+  upload-actions:
+    name: Upload Actions analysis
+    needs: actions
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Download SARIF artifact
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: codeql-actions
+          path: sarif
+      - name: Upload analysis to code scanning
+        uses: github/codeql-action/upload-sarif@24c54180a607b1449ed407dd24f251e4e9147c8d # v4
+        with:
+          sarif_file: sarif
+          category: /language:actions
+          wait-for-processing: true
+
+  upload-gate:
+    name: Code scanning uploads
+    needs: [upload-swift, upload-actions]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Require every analysis upload to succeed
+        env:
+          SWIFT_UPLOAD_RESULT: ${{ needs.upload-swift.result }}
+          ACTIONS_UPLOAD_RESULT: ${{ needs.upload-actions.result }}
+        run: |
+          if [[ "$SWIFT_UPLOAD_RESULT" != "success" ]] || [[ "$ACTIONS_UPLOAD_RESULT" != "success" ]]; then
+            printf 'Code scanning upload failed or was skipped: swift=%s; actions=%s\n' "$SWIFT_UPLOAD_RESULT" "$ACTIONS_UPLOAD_RESULT" >&2
+            exit 1
+          fi
