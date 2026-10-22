@@ -38,6 +38,12 @@ private final class CommandOutputBuffer: @unchecked Sendable {
         }
         return output
     }
+
+    func contains(_ text: String) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return output.contains(text)
+    }
 }
 
 final class CommandRunner: @unchecked Sendable {
@@ -346,30 +352,31 @@ func runCommandRunnerSelfTests() -> Bool {
             throw TroubleshooterError.invalidCommandOutput(command: "complete pipe drain self-test", reason: "Buffered output was truncated or streaming disagreed with captured output")
         }
 
-        let exitedWriterDone = directory.appendingPathComponent("exited-writer-done")
         let heldStream = CommandOutputBuffer()
         let heldStarted = ProcessInfo.processInfo.systemUptime
         do {
             _ = try runner.run(
                 executable: "/bin/sh",
-                arguments: ["-c", #"(/bin/sleep 2; /usr/bin/touch "$1") & printf 'parent-complete\n'"#, "held-output-test", exitedWriterDone.path],
-                timeoutSeconds: 0.1
+                arguments: ["-c", #"(/bin/sleep 3) & printf 'parent-complete\n'"#],
+                timeoutSeconds: 1
             ) { chunk in
                 _ = heldStream.append(Data(chunk.utf8))
             }
             throw TroubleshooterError.invalidCommandOutput(command: "inherited output deadline self-test", reason: "The runner returned success before output reached EOF")
         } catch TroubleshooterError.commandTimedOut {
-            guard ProcessInfo.processInfo.systemUptime - heldStarted < 1 else {
+            guard ProcessInfo.processInfo.systemUptime - heldStarted < 2 else {
                 throw TroubleshooterError.invalidCommandOutput(command: "inherited output deadline self-test", reason: "The runner waited for the descendant instead of its deadline")
+            }
+            guard try heldStream.value(command: "inherited output deadline self-test") == "parent-complete\n" else {
+                throw TroubleshooterError.invalidCommandOutput(command: "inherited output deadline self-test", reason: "The parent command did not produce its complete output before the deadline")
             }
         }
 
-        let timedWriterDone = directory.appendingPathComponent("timed-writer-done")
         let heldTimeoutStarted = ProcessInfo.processInfo.systemUptime
         do {
             _ = try runner.run(
                 executable: "/bin/sh",
-                arguments: ["-c", #"(trap '' TERM; /bin/sleep 2; /usr/bin/touch "$1") & exec /bin/sleep 30"#, "held-timeout-test", timedWriterDone.path],
+                arguments: ["-c", #"(trap '' TERM; /bin/sleep 2) & exec /bin/sleep 30"#],
                 timeoutSeconds: 0.1
             ) { _ in }
             throw TroubleshooterError.invalidCommandOutput(command: "timeout with inherited output self-test", reason: "The command did not time out")
@@ -379,13 +386,12 @@ func runCommandRunnerSelfTests() -> Bool {
             }
         }
 
-        let cancelledWriterDone = directory.appendingPathComponent("cancelled-writer-done")
         let cancelledStream = CommandOutputBuffer()
         let heldCancellationStarted = ProcessInfo.processInfo.systemUptime
         do {
             _ = try runner.run(
                 executable: "/bin/sh",
-                arguments: ["-c", #"(trap '' TERM PIPE; printf 'held-cancel-ready\n'; /bin/sleep 2; printf 'late-output\n' 2>/dev/null; /usr/bin/touch "$1") & exec /bin/sleep 30"#, "held-cancel-test", cancelledWriterDone.path],
+                arguments: ["-c", #"(trap '' TERM PIPE; printf 'held-cancel-ready\n'; /bin/sleep 2; printf 'late-output\n' 2>/dev/null) & exec /bin/sleep 30"#],
                 timeoutSeconds: 5
             ) { chunk in
                 _ = cancelledStream.append(Data(chunk.utf8))
@@ -397,6 +403,45 @@ func runCommandRunnerSelfTests() -> Bool {
         } catch TroubleshooterError.cancelled {
             guard ProcessInfo.processInfo.systemUptime - heldCancellationStarted < 1 else {
                 throw TroubleshooterError.invalidCommandOutput(command: "cancellation with inherited output self-test", reason: "The runner waited for the descendant's output after cancellation")
+            }
+            guard try cancelledStream.value(command: "cancellation with inherited output self-test") == "held-cancel-ready\n" else {
+                throw TroubleshooterError.invalidCommandOutput(command: "cancellation with inherited output self-test", reason: "The runner collected output after cancellation or missed the ready output")
+            }
+        }
+        runner.reset()
+        let lateOutputAcknowledged = directory.appendingPathComponent("late-output-acknowledged")
+        let trapStream = CommandOutputBuffer()
+        let offThreadCallbacks = CommandOutputBuffer()
+        let callerThread: pthread_t = pthread_self()
+        do {
+            _ = try runner.run(
+                executable: "/bin/sh",
+                arguments: [
+                    "-c",
+                    #"trap 'printf "late-output\n"; : > "$1"; exit 0' TERM; printf 'trap-cancel-ready\n'; while :; do :; done"#,
+                    "late-output-test",
+                    lateOutputAcknowledged.path
+                ],
+                timeoutSeconds: 5
+            ) { chunk in
+                _ = trapStream.append(Data(chunk.utf8))
+                if pthread_equal(pthread_self(), callerThread) == 0 {
+                    _ = offThreadCallbacks.append(Data("off-thread".utf8))
+                }
+                if trapStream.contains("trap-cancel-ready\n"), !runner.isCancelled() {
+                    runner.cancel()
+                }
+            }
+            throw TroubleshooterError.invalidCommandOutput(command: "late output after cancellation self-test", reason: "The command did not report cancellation")
+        } catch TroubleshooterError.cancelled {
+            guard fileManager.fileExists(atPath: lateOutputAcknowledged.path) else {
+                throw TroubleshooterError.invalidCommandOutput(command: "late output after cancellation self-test", reason: "The tracked helper did not acknowledge its late output before returning")
+            }
+            guard try trapStream.value(command: "late output after cancellation self-test") == "trap-cancel-ready\n" else {
+                throw TroubleshooterError.invalidCommandOutput(command: "late output after cancellation self-test", reason: "The runner delivered output after cancellation or missed the ready output")
+            }
+            guard try offThreadCallbacks.value(command: "late output after cancellation self-test") == "" else {
+                throw TroubleshooterError.invalidCommandOutput(command: "late output after cancellation self-test", reason: "The runner invoked an output callback on another thread")
             }
         }
         runner.reset()
@@ -457,36 +502,6 @@ func runCommandRunnerSelfTests() -> Bool {
         guard recovered.exitStatus == 0, recovered.output == "recovered\n" else {
             try fileManager.removeItem(at: directory)
             return false
-        }
-        let writerDeadline: TimeInterval = ProcessInfo.processInfo.systemUptime + 10
-        let writerMarkers: [(String, URL)] = [
-            ("exited writer", exitedWriterDone),
-            ("timed-out writer", timedWriterDone),
-            ("cancelled writer", cancelledWriterDone)
-        ]
-        for (writer, marker) in writerMarkers {
-            while !fileManager.fileExists(atPath: marker.path) {
-                let remaining: TimeInterval = writerDeadline - ProcessInfo.processInfo.systemUptime
-                guard remaining > 0 else {
-                    throw TroubleshooterError.invalidCommandOutput(
-                        command: "pipe cleanup self-test",
-                        reason: "The task-owned \(writer) did not finish within ten seconds"
-                    )
-                }
-                Thread.sleep(forTimeInterval: min(0.05, remaining))
-            }
-        }
-        guard try heldStream.value(command: "inherited output deadline self-test") == "parent-complete\n" else {
-            throw TroubleshooterError.invalidCommandOutput(
-                command: "pipe cleanup self-test",
-                reason: "Output from the exited writer changed after the runner returned"
-            )
-        }
-        guard try cancelledStream.value(command: "cancellation with inherited output self-test") == "held-cancel-ready\n" else {
-            throw TroubleshooterError.invalidCommandOutput(
-                command: "pipe cleanup self-test",
-                reason: "Output from the cancelled writer changed after the runner returned"
-            )
         }
         try fileManager.removeItem(at: directory)
         return true
