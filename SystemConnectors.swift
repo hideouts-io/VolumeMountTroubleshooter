@@ -458,12 +458,35 @@ func runCommandRunnerSelfTests() -> Bool {
             try fileManager.removeItem(at: directory)
             return false
         }
-        guard fileManager.fileExists(atPath: exitedWriterDone.path),
-              fileManager.fileExists(atPath: timedWriterDone.path),
-              fileManager.fileExists(atPath: cancelledWriterDone.path),
-              try heldStream.value(command: "inherited output deadline self-test") == "parent-complete\n",
-              try cancelledStream.value(command: "cancellation with inherited output self-test") == "held-cancel-ready\n" else {
-            throw TroubleshooterError.invalidCommandOutput(command: "pipe cleanup self-test", reason: "Task-owned writers did not finish or output arrived after the runner returned")
+        let writerDeadline: TimeInterval = ProcessInfo.processInfo.systemUptime + 10
+        let writerMarkers: [(String, URL)] = [
+            ("exited writer", exitedWriterDone),
+            ("timed-out writer", timedWriterDone),
+            ("cancelled writer", cancelledWriterDone)
+        ]
+        for (writer, marker) in writerMarkers {
+            while !fileManager.fileExists(atPath: marker.path) {
+                let remaining: TimeInterval = writerDeadline - ProcessInfo.processInfo.systemUptime
+                guard remaining > 0 else {
+                    throw TroubleshooterError.invalidCommandOutput(
+                        command: "pipe cleanup self-test",
+                        reason: "The task-owned \(writer) did not finish within ten seconds"
+                    )
+                }
+                Thread.sleep(forTimeInterval: min(0.05, remaining))
+            }
+        }
+        guard try heldStream.value(command: "inherited output deadline self-test") == "parent-complete\n" else {
+            throw TroubleshooterError.invalidCommandOutput(
+                command: "pipe cleanup self-test",
+                reason: "Output from the exited writer changed after the runner returned"
+            )
+        }
+        guard try cancelledStream.value(command: "cancellation with inherited output self-test") == "held-cancel-ready\n" else {
+            throw TroubleshooterError.invalidCommandOutput(
+                command: "pipe cleanup self-test",
+                reason: "Output from the cancelled writer changed after the runner returned"
+            )
         }
         try fileManager.removeItem(at: directory)
         return true
