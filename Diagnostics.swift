@@ -196,6 +196,8 @@ enum TroubleshooterError: LocalizedError {
     case commandLaunchFailed(executable: String, reason: String)
     case commandFailed(command: String, exitStatus: Int32, output: String)
     case commandTimedOut(command: String, timeoutSeconds: TimeInterval)
+    case commandOutputFailed(command: String, reason: String)
+    case commandTerminationFailed(command: String, reason: String)
     case invalidPropertyList(command: String, reason: String)
     case invalidJSON(command: String, reason: String)
     case selectedStorageChanged(reason: String)
@@ -212,7 +214,11 @@ enum TroubleshooterError: LocalizedError {
             let detail = output.trimmingCharacters(in: .whitespacesAndNewlines)
             return "Command failed with exit status \(exitStatus): \(command)\n\(detail)"
         case let .commandTimedOut(command, timeoutSeconds):
-            return "Command timed out after \(Int(timeoutSeconds)) seconds: \(command). The storage device may still be changing state; wait for the automatic rescan or press Refresh."
+            return "Command timed out after \(Int(timeoutSeconds)) seconds: \(command). The cause is unknown. Review any pending macOS access prompt, then press Refresh when ready."
+        case let .commandOutputFailed(command, reason):
+            return "Could not collect complete command output from \(command): \(reason). Press Refresh to collect a new report."
+        case let .commandTerminationFailed(command, reason):
+            return "Could not finish stopping \(command): \(reason)"
         case let .invalidPropertyList(command, reason):
             return "Could not decode structured output from \(command): \(reason)"
         case let .invalidJSON(command, reason):
@@ -1126,6 +1132,25 @@ func runSelfTests() -> Bool {
         }
         return false
     } catch TroubleshooterError.cancelled {
+    } catch {
+        return false
+    }
+
+    do {
+        _ = try externalDiskSnapshot(entries: [decoded.disks[0]]) { _ in
+            throw TroubleshooterError.commandTerminationFailed(command: "self-test", reason: "helper exit is unacknowledged")
+        }
+        return false
+    } catch TroubleshooterError.commandTerminationFailed {
+    } catch {
+        return false
+    }
+    do {
+        _ = try externalDiskSnapshot(entries: [decoded.disks[0]]) { _ in
+            throw TroubleshooterError.commandOutputFailed(command: "self-test", reason: "output channel failed")
+        }
+        return false
+    } catch TroubleshooterError.commandOutputFailed {
     } catch {
         return false
     }

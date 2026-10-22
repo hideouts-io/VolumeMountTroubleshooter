@@ -43,6 +43,7 @@ private final class CommandOutputBuffer: @unchecked Sendable {
 final class CommandRunner: @unchecked Sendable {
     private let lock = NSLock()
     private var currentProcess: Process?
+    private var commandInProgress = false
     private var cancellationRequested = false
 
     func reset() {
@@ -56,7 +57,9 @@ final class CommandRunner: @unchecked Sendable {
         cancellationRequested = true
         let process = currentProcess
         lock.unlock()
-        process?.terminate()
+        if let process, process.isRunning {
+            process.terminate()
+        }
     }
 
     func isCancelled() -> Bool {
@@ -78,29 +81,68 @@ final class CommandRunner: @unchecked Sendable {
         process.arguments = arguments
         process.standardOutput = outputPipe
         process.standardError = outputPipe
+        let command = renderedCommand(executable: executable, arguments: arguments)
+        let readHandle = outputPipe.fileHandleForReading
+        let descriptor = readHandle.fileDescriptor
+        let flags = Darwin.fcntl(descriptor, F_GETFL)
+        guard flags != -1, Darwin.fcntl(descriptor, F_SETFL, flags | O_NONBLOCK) != -1 else {
+            let code = errno
+            throw TroubleshooterError.commandOutputFailed(
+                command: command,
+                reason: "Could not configure nonblocking output reads (errno \(code)): \(String(cString: strerror(code)))"
+            )
+        }
 
         defer {
             lock.lock()
-            currentProcess = nil
+            if currentProcess === process {
+                commandInProgress = false
+                if !process.isRunning {
+                    currentProcess = nil
+                }
+            }
             lock.unlock()
         }
 
-        let processFinished = DispatchSemaphore(value: 0)
+        let processFinished = DispatchGroup()
+        processFinished.enter()
         process.terminationHandler = { _ in
-            processFinished.signal()
+            processFinished.leave()
         }
 
         lock.lock()
+        guard !commandInProgress else {
+            lock.unlock()
+            processFinished.leave()
+            throw TroubleshooterError.commandLaunchFailed(
+                executable: executable,
+                reason: "This command runner is still collecting another command. Wait for its result before trying again."
+            )
+        }
+        if let pendingProcess = currentProcess {
+            guard !pendingProcess.isRunning else {
+                lock.unlock()
+                processFinished.leave()
+                throw TroubleshooterError.commandLaunchFailed(
+                    executable: executable,
+                    reason: "The previous helper (PID \(pendingProcess.processIdentifier)) has not exited after termination. Wait for it to exit before trying again."
+                )
+            }
+            currentProcess = nil
+        }
         guard !cancellationRequested else {
             lock.unlock()
+            processFinished.leave()
             throw TroubleshooterError.cancelled
         }
         do {
             try process.run()
             currentProcess = process
+            commandInProgress = true
             lock.unlock()
         } catch {
             lock.unlock()
+            processFinished.leave()
             throw TroubleshooterError.commandLaunchFailed(
                 executable: executable,
                 reason: error.localizedDescription
@@ -108,49 +150,136 @@ final class CommandRunner: @unchecked Sendable {
         }
 
         let outputBuffer = CommandOutputBuffer()
-        let readHandle = outputPipe.fileHandleForReading
-        let outputGroup = DispatchGroup()
-        outputGroup.enter()
-        DispatchQueue.global(qos: .utility).async {
-            defer {
-                outputGroup.leave()
-            }
-            while true {
-                let data = readHandle.availableData
-                if data.isEmpty {
-                    break
-                }
-                let chunk = outputBuffer.append(data)
-                if !chunk.isEmpty {
-                    onOutput(chunk)
-                }
-            }
-        }
-
-        let waitResult = processFinished.wait(timeout: .now() + timeoutSeconds)
-        if waitResult == .timedOut {
-            process.terminate()
-            if processFinished.wait(timeout: .now() + 2) == .timedOut {
-                Darwin.kill(process.processIdentifier, SIGKILL)
-                processFinished.wait()
-            }
-        }
-        outputGroup.wait()
-
-        if isCancelled() {
-            throw TroubleshooterError.cancelled
-        }
-        if waitResult == .timedOut {
-            throw TroubleshooterError.commandTimedOut(
-                command: renderedCommand(executable: executable, arguments: arguments),
-                timeoutSeconds: timeoutSeconds
+        var failure = collectCommandOutput(
+            descriptor: descriptor,
+            processFinished: processFinished,
+            outputBuffer: outputBuffer,
+            command: command,
+            timeoutSeconds: timeoutSeconds,
+            isCancelled: { self.isCancelled() },
+            onOutput: onOutput
+        )
+        if let originalFailure = failure,
+           let terminationFailure = finishCommandProcess(process: process, finished: processFinished, command: command) {
+            failure = .commandTerminationFailed(
+                command: command,
+                reason: "\(originalFailure.localizedDescription) Cleanup also failed: \(terminationFailure.localizedDescription)"
             )
+        }
+        do {
+            try readHandle.close()
+        } catch {
+            let originalFailure = failure.map { "\($0.localizedDescription) " } ?? ""
+            failure = .commandOutputFailed(
+                command: command,
+                reason: "\(originalFailure)Could not close the command's output pipe: \(error.localizedDescription)"
+            )
+        }
+        if isCancelled() {
+            switch failure {
+            case nil, .commandTimedOut?:
+                failure = .cancelled
+            default:
+                break
+            }
+        }
+        if let failure {
+            throw failure
         }
         return CommandResult(
             exitStatus: process.terminationStatus,
-            output: try outputBuffer.value(command: renderedCommand(executable: executable, arguments: arguments))
+            output: try outputBuffer.value(command: command)
         )
     }
+}
+
+/// One reader owns the pipe until EOF or failure; the deadline covers both child exit and complete output.
+private func collectCommandOutput(
+    descriptor: Int32,
+    processFinished: DispatchGroup,
+    outputBuffer: CommandOutputBuffer,
+    command: String,
+    timeoutSeconds: TimeInterval,
+    isCancelled: () -> Bool,
+    onOutput: (String) -> Void
+) -> TroubleshooterError? {
+    let deadline = ProcessInfo.processInfo.systemUptime + timeoutSeconds
+    var reachedEOF = false
+    var bytes = [UInt8](repeating: 0, count: 65_536)
+    while true {
+        if isCancelled() {
+            return .cancelled
+        }
+        let remaining = deadline - ProcessInfo.processInfo.systemUptime
+        guard remaining > 0 else {
+            return .commandTimedOut(command: command, timeoutSeconds: timeoutSeconds)
+        }
+        if reachedEOF, processFinished.wait(timeout: .now()) == .success {
+            return nil
+        }
+        let interval = min(0.05, remaining)
+        if reachedEOF {
+            _ = processFinished.wait(timeout: .now() + interval)
+            continue
+        }
+        var event = pollfd(fd: descriptor, events: Int16(POLLIN | POLLHUP), revents: 0)
+        let ready = Darwin.poll(&event, 1, Int32(ceil(interval * 1_000)))
+        if ready < 0 {
+            let code = errno
+            if code == EINTR {
+                continue
+            }
+            return .commandOutputFailed(command: command, reason: "Output poll failed (errno \(code)): \(String(cString: strerror(code)))")
+        }
+        if isCancelled() {
+            return .cancelled
+        }
+        guard ready > 0 else { continue }
+        if event.revents & Int16(POLLNVAL) != 0 {
+            return .commandOutputFailed(command: command, reason: "The command's output descriptor became invalid while collecting output.")
+        }
+        let count = bytes.withUnsafeMutableBytes { buffer in
+            Darwin.read(descriptor, buffer.baseAddress, buffer.count)
+        }
+        if count < 0 {
+            let code = errno
+            if code == EINTR || code == EAGAIN || code == EWOULDBLOCK {
+                continue
+            }
+            return .commandOutputFailed(command: command, reason: "Output read failed (errno \(code)): \(String(cString: strerror(code)))")
+        }
+        if count == 0 {
+            reachedEOF = true
+            continue
+        }
+        let chunk = outputBuffer.append(Data(bytes.prefix(count)))
+        if !chunk.isEmpty {
+            onOutput(chunk)
+        }
+    }
+}
+
+/// Keep both termination waits finite and retain a live Process in its runner if cleanup cannot complete.
+private func finishCommandProcess(process: Process, finished: DispatchGroup, command: String) -> TroubleshooterError? {
+    if finished.wait(timeout: .now()) == .success {
+        return nil
+    }
+    if process.isRunning {
+        process.terminate()
+    }
+    if finished.wait(timeout: .now() + 2) == .success {
+        return nil
+    }
+    if process.isRunning, Darwin.kill(process.processIdentifier, SIGKILL) != 0 {
+        let code = errno
+        if code != ESRCH {
+            return .commandTerminationFailed(command: command, reason: "Could not stop helper PID \(process.processIdentifier) (errno \(code)): \(String(cString: strerror(code)))")
+        }
+    }
+    guard finished.wait(timeout: .now() + 2) == .success else {
+        return .commandTerminationFailed(command: command, reason: "Helper PID \(process.processIdentifier) did not acknowledge exit within two seconds after SIGKILL. Its runner remains unavailable until it exits.")
+    }
+    return nil
 }
 
 /// Exercises actual pipe boundaries, command failure output and cancellation without touching storage devices.
@@ -203,6 +332,74 @@ func runCommandRunnerSelfTests() -> Bool {
             return false
         } catch TroubleshooterError.invalidCommandOutput {
         }
+        let bulkStream = CommandOutputBuffer()
+        let bulk = try runner.run(
+            executable: "/usr/bin/awk",
+            arguments: ["BEGIN { for (i = 0; i < 131072; i++) printf \"x\" }"],
+            timeoutSeconds: 5
+        ) { chunk in
+            _ = bulkStream.append(Data(chunk.utf8))
+        }
+        guard bulk.exitStatus == 0,
+              bulk.output == String(repeating: "x", count: 131_072),
+              try bulkStream.value(command: "complete pipe drain self-test") == bulk.output else {
+            throw TroubleshooterError.invalidCommandOutput(command: "complete pipe drain self-test", reason: "Buffered output was truncated or streaming disagreed with captured output")
+        }
+
+        let exitedWriterDone = directory.appendingPathComponent("exited-writer-done")
+        let heldStream = CommandOutputBuffer()
+        let heldStarted = ProcessInfo.processInfo.systemUptime
+        do {
+            _ = try runner.run(
+                executable: "/bin/sh",
+                arguments: ["-c", #"(/bin/sleep 2; /usr/bin/touch "$1") & printf 'parent-complete\n'"#, "held-output-test", exitedWriterDone.path],
+                timeoutSeconds: 0.1
+            ) { chunk in
+                _ = heldStream.append(Data(chunk.utf8))
+            }
+            throw TroubleshooterError.invalidCommandOutput(command: "inherited output deadline self-test", reason: "The runner returned success before output reached EOF")
+        } catch TroubleshooterError.commandTimedOut {
+            guard ProcessInfo.processInfo.systemUptime - heldStarted < 1 else {
+                throw TroubleshooterError.invalidCommandOutput(command: "inherited output deadline self-test", reason: "The runner waited for the descendant instead of its deadline")
+            }
+        }
+
+        let timedWriterDone = directory.appendingPathComponent("timed-writer-done")
+        let heldTimeoutStarted = ProcessInfo.processInfo.systemUptime
+        do {
+            _ = try runner.run(
+                executable: "/bin/sh",
+                arguments: ["-c", #"(trap '' TERM; /bin/sleep 2; /usr/bin/touch "$1") & exec /bin/sleep 30"#, "held-timeout-test", timedWriterDone.path],
+                timeoutSeconds: 0.1
+            ) { _ in }
+            throw TroubleshooterError.invalidCommandOutput(command: "timeout with inherited output self-test", reason: "The command did not time out")
+        } catch TroubleshooterError.commandTimedOut {
+            guard ProcessInfo.processInfo.systemUptime - heldTimeoutStarted < 1 else {
+                throw TroubleshooterError.invalidCommandOutput(command: "timeout with inherited output self-test", reason: "The runner waited for the descendant's output after stopping its child")
+            }
+        }
+
+        let cancelledWriterDone = directory.appendingPathComponent("cancelled-writer-done")
+        let cancelledStream = CommandOutputBuffer()
+        let heldCancellationStarted = ProcessInfo.processInfo.systemUptime
+        do {
+            _ = try runner.run(
+                executable: "/bin/sh",
+                arguments: ["-c", #"(trap '' TERM PIPE; printf 'held-cancel-ready\n'; /bin/sleep 2; printf 'late-output\n' 2>/dev/null; /usr/bin/touch "$1") & exec /bin/sleep 30"#, "held-cancel-test", cancelledWriterDone.path],
+                timeoutSeconds: 5
+            ) { chunk in
+                _ = cancelledStream.append(Data(chunk.utf8))
+                if chunk.contains("held-cancel-ready") {
+                    runner.cancel()
+                }
+            }
+            throw TroubleshooterError.invalidCommandOutput(command: "cancellation with inherited output self-test", reason: "The command did not report cancellation")
+        } catch TroubleshooterError.cancelled {
+            guard ProcessInfo.processInfo.systemUptime - heldCancellationStarted < 1 else {
+                throw TroubleshooterError.invalidCommandOutput(command: "cancellation with inherited output self-test", reason: "The runner waited for the descendant's output after cancellation")
+            }
+        }
+        runner.reset()
         runner.cancel()
         let forbiddenFile = directory.appendingPathComponent("cancelled-command-launched")
         do {
@@ -218,6 +415,55 @@ func runCommandRunnerSelfTests() -> Bool {
                 try fileManager.removeItem(at: directory)
                 return false
             }
+        }
+        runner.reset()
+        let cancellationStarted = ProcessInfo.processInfo.systemUptime
+        do {
+            _ = try runner.run(
+                executable: "/bin/sh",
+                arguments: ["-c", "trap '' TERM; printf 'cancel-ready\\n'; exec /bin/sleep 30"],
+                timeoutSeconds: 5
+            ) { chunk in
+                if chunk.contains("cancel-ready") {
+                    runner.cancel()
+                }
+            }
+            try fileManager.removeItem(at: directory)
+            return false
+        } catch TroubleshooterError.cancelled {
+            let cancellationElapsed = ProcessInfo.processInfo.systemUptime - cancellationStarted
+            guard cancellationElapsed < 4 else {
+                FileHandle.standardError.write(Data("Active cancellation waited for the original command deadline\n".utf8))
+                try fileManager.removeItem(at: directory)
+                return false
+            }
+        }
+        runner.reset()
+        do {
+            _ = try runner.run(
+                executable: "/bin/sh",
+                arguments: ["-c", "trap '' TERM; exec /bin/sleep 30"],
+                timeoutSeconds: 0.1
+            ) { _ in }
+            try fileManager.removeItem(at: directory)
+            return false
+        } catch TroubleshooterError.commandTimedOut {
+        }
+        let recovered = try runner.run(
+            executable: "/bin/sh",
+            arguments: ["-c", "printf 'recovered\\n'"],
+            timeoutSeconds: 5
+        ) { _ in }
+        guard recovered.exitStatus == 0, recovered.output == "recovered\n" else {
+            try fileManager.removeItem(at: directory)
+            return false
+        }
+        guard fileManager.fileExists(atPath: exitedWriterDone.path),
+              fileManager.fileExists(atPath: timedWriterDone.path),
+              fileManager.fileExists(atPath: cancelledWriterDone.path),
+              try heldStream.value(command: "inherited output deadline self-test") == "parent-complete\n",
+              try cancelledStream.value(command: "cancellation with inherited output self-test") == "held-cancel-ready\n" else {
+            throw TroubleshooterError.invalidCommandOutput(command: "pipe cleanup self-test", reason: "Task-owned writers did not finish or output arrived after the runner returned")
         }
         try fileManager.removeItem(at: directory)
         return true
@@ -268,6 +514,12 @@ func externalDiskSnapshot(
         } catch TroubleshooterError.cancelled {
             throw TroubleshooterError.cancelled
         } catch let error as TroubleshooterError {
+            switch error {
+            case .commandTerminationFailed, .commandOutputFailed:
+                throw error
+            default:
+                break
+            }
             scanFailures.append(
                 DiskScanFailure(
                     diskIdentifier: entry.identifier,
@@ -573,6 +825,12 @@ final class DiskScanner: @unchecked Sendable {
         } catch TroubleshooterError.cancelled {
             throw TroubleshooterError.cancelled
         } catch let error as TroubleshooterError {
+            switch error {
+            case .commandTerminationFailed, .commandOutputFailed:
+                throw error
+            default:
+                break
+            }
             return .unavailable(reason: error.localizedDescription)
         }
         do {
