@@ -8,8 +8,14 @@ private struct MountRequestOutcome {
     let currentInfo: DiskInfoPropertyList?
 }
 
+private enum WorkbenchToolbarItem {
+    static let refresh = NSToolbarItem.Identifier("refresh")
+    static let stop = NSToolbarItem.Identifier("stop")
+    static let reveal = NSToolbarItem.Identifier("revealVolumes")
+}
+
 @MainActor
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
     private let runner = CommandRunner()
     private let scanRunner = CommandRunner()
     private let unlockRetryLimit = 5
@@ -82,12 +88,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func configureWindow() {
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 1060, height: 760),
+            contentRect: NSRect(x: 0, y: 0, width: 1060, height: 740),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered,
             defer: false
         )
         window.title = "Volume Mount Troubleshooter"
+        window.titleVisibility = .hidden
+        window.toolbarStyle = .unified
         window.isRestorable = false
         window.center()
         window.minSize = NSSize(width: 820, height: 600)
@@ -95,11 +103,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let rootView = NSView()
         window.contentView = rootView
 
-        let titleLabel = NSTextField(labelWithString: "External Volume Mount Troubleshooter")
-        titleLabel.font = NSFont.systemFont(ofSize: 22, weight: .semibold)
+        let titleLabel = NSTextField(labelWithString: "Volume Mount Troubleshooter")
+        titleLabel.font = NSFont.systemFont(ofSize: 20, weight: .semibold)
 
         let subtitleLabel = NSTextField(
-            wrappingLabelWithString: "Select one external volume, then choose Inspect, Mount Read-Only, Mount Normally, Unmount Volume, or Safe Eject Disk. No erase, format, repair, or credential collection."
+            wrappingLabelWithString: "Inspect external storage read-only. Disk actions require confirmation; no erase, format, or repair."
         )
         subtitleLabel.textColor = .secondaryLabelColor
         subtitleLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
@@ -121,10 +129,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let headerStack = NSStackView(views: [logoImageView, titleStack])
         headerStack.orientation = .horizontal
         headerStack.alignment = .centerY
-        headerStack.spacing = 14
+        headerStack.spacing = 12
 
-        let selectorLabel = NSTextField(labelWithString: "External volume:")
-        selectorLabel.font = NSFont.systemFont(ofSize: 13, weight: .medium)
+        let selectorLabel = NSTextField(labelWithString: "SELECTED EXTERNAL VOLUME")
+        selectorLabel.font = NSFont.systemFont(ofSize: 11, weight: .semibold)
+        selectorLabel.textColor = .secondaryLabelColor
 
         let volumePopup = NSPopUpButton()
         volumePopup.setAccessibilityIdentifier("volumeSelector")
@@ -139,7 +148,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         refreshButton.bezelStyle = .rounded
         self.refreshButton = refreshButton
 
-        let selectorStack = NSStackView(views: [selectorLabel, volumePopup, refreshButton])
+        let selectorStack = NSStackView(views: [selectorLabel, volumePopup])
         selectorStack.orientation = .horizontal
         selectorStack.spacing = 8
         selectorStack.alignment = .centerY
@@ -170,25 +179,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         unlockProgressLabel.isHidden = true
         self.unlockProgressLabel = unlockProgressLabel
 
-        let redactCheckbox = NSButton(checkboxWithTitle: "Redact shared reports", target: self, action: nil)
+        let redactCheckbox = NSButton(checkboxWithTitle: "Redact copied/saved reports", target: self, action: nil)
         redactCheckbox.setAccessibilityIdentifier("redactSharedReports")
         redactCheckbox.state = .on
         self.redactCheckbox = redactCheckbox
-
-        let optionStack = NSStackView(views: [redactCheckbox])
-        optionStack.orientation = .horizontal
-        optionStack.spacing = 20
-        optionStack.alignment = .centerY
 
         let statusLabel = NSTextField(labelWithString: "Scanning…")
         statusLabel.font = NSFont.systemFont(ofSize: 13, weight: .medium)
         self.statusLabel = statusLabel
 
-        let actionLabel = NSTextField(labelWithString: "Selected volume actions:")
-        actionLabel.font = NSFont.systemFont(ofSize: 13, weight: .medium)
+        let selectionDetails = NSStackView(views: [
+            selectorStack,
+            volumeDetailLabel,
+            smartDetailLabel,
+            connectionPathLabel,
+            unlockProgressLabel,
+            statusLabel
+        ])
+        selectionDetails.orientation = .vertical
+        selectionDetails.alignment = .leading
+        selectionDetails.spacing = 6
+
+        let inspectionLabel = NSTextField(labelWithString: "READ-ONLY INSPECTION")
+        inspectionLabel.font = NSFont.systemFont(ofSize: 11, weight: .semibold)
+        inspectionLabel.textColor = .secondaryLabelColor
+
+        let operationsLabel = NSTextField(labelWithString: "DISK OPERATIONS")
+        operationsLabel.font = NSFont.systemFont(ofSize: 11, weight: .semibold)
+        operationsLabel.textColor = .secondaryLabelColor
 
         let inspectButton = NSButton(title: "Inspect", target: self, action: #selector(inspectSelectedVolume))
         inspectButton.bezelStyle = .rounded
+        inspectButton.controlSize = .large
         inspectButton.keyEquivalent = "\r"
         inspectButton.identifier = NSUserInterfaceItemIdentifier("inspectButton")
         inspectButton.setAccessibilityIdentifier("inspectButton")
@@ -267,35 +289,59 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         let revealButton = NSButton(title: "Show Volumes", target: self, action: #selector(revealVolumes))
         revealButton.bezelStyle = .rounded
+        revealButton.setAccessibilityIdentifier("showVolumesButton")
         self.revealButton = revealButton
 
-        let actionStack = NSStackView(views: [
-            inspectButton,
+        let inspectionStack = NSStackView(views: [inspectionLabel, inspectButton])
+        inspectionStack.orientation = .vertical
+        inspectionStack.alignment = .leading
+        inspectionStack.spacing = 6
+
+        let operationButtons = NSStackView(views: [
             mountReadOnlyButton,
             mountNormallyButton,
             unmountButton,
             ejectButton,
         ])
-        actionStack.orientation = .horizontal
-        actionStack.spacing = 8
-        actionStack.alignment = .centerY
+        operationButtons.orientation = .horizontal
+        operationButtons.spacing = 8
+        operationButtons.alignment = .centerY
+        [mountReadOnlyButton, mountNormallyButton, unmountButton, ejectButton].forEach {
+            $0.controlSize = .small
+        }
 
-        let utilityButtonStack = NSStackView(views: [
-            stopButton,
-            showUnlockerButton,
+        let operationsStack = NSStackView(views: [operationsLabel, operationButtons])
+        operationsStack.orientation = .vertical
+        operationsStack.alignment = .leading
+        operationsStack.spacing = 6
+
+        let actionStack = NSStackView(views: [inspectionStack, operationsStack])
+        actionStack.orientation = .horizontal
+        actionStack.spacing = 20
+        actionStack.alignment = .top
+
+        let reportLabel = NSTextField(labelWithString: "LIVE COMMAND OUTPUT")
+        reportLabel.font = NSFont.systemFont(ofSize: 11, weight: .semibold)
+        reportLabel.textColor = .secondaryLabelColor
+
+        let reportSpacer = NSView()
+        reportSpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        let reportHeader = NSStackView(views: [
+            reportLabel,
+            reportSpacer,
+            redactCheckbox,
             copyButton,
-            saveButton,
-            revealButton
+            saveButton
         ])
-        utilityButtonStack.orientation = .horizontal
-        utilityButtonStack.spacing = 8
-        utilityButtonStack.alignment = .centerY
+        reportHeader.orientation = .horizontal
+        reportHeader.spacing = 8
+        reportHeader.alignment = .centerY
 
         let scrollView = NSScrollView()
         scrollView.hasVerticalScroller = true
         scrollView.hasHorizontalScroller = false
         scrollView.autohidesScrollers = false
-        scrollView.borderType = .bezelBorder
+        scrollView.borderType = .lineBorder
 
         let textView = NSTextView()
         textView.setAccessibilityIdentifier("diagnosticConsole")
@@ -303,8 +349,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         textView.isSelectable = true
         textView.isRichText = false
         textView.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
-        textView.textColor = NSColor(calibratedRed: 0.78, green: 0.94, blue: 0.80, alpha: 1)
-        textView.backgroundColor = NSColor(calibratedWhite: 0.08, alpha: 1)
+        textView.textColor = .labelColor
+        textView.backgroundColor = .textBackgroundColor
         textView.textContainerInset = NSSize(width: 10, height: 10)
         textView.isHorizontallyResizable = false
         textView.isVerticallyResizable = true
@@ -315,23 +361,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         scrollView.documentView = textView
         self.textView = textView
 
+        let toolbar = NSToolbar(identifier: "WorkbenchToolbar")
+        toolbar.delegate = self
+        toolbar.displayMode = .iconOnly
+        toolbar.allowsUserCustomization = false
+        window.toolbar = toolbar
+
         let contentStack = NSStackView(views: [
             headerStack,
-            selectorStack,
-            volumeDetailLabel,
-            smartDetailLabel,
-            connectionPathLabel,
-            unlockProgressLabel,
-            optionStack,
-            statusLabel,
-            actionLabel,
+            selectionDetails,
             actionStack,
-            utilityButtonStack,
+            showUnlockerButton,
+            reportHeader,
             scrollView
         ])
         contentStack.orientation = .vertical
         contentStack.alignment = .leading
-        contentStack.spacing = 9
+        contentStack.spacing = 10
         contentStack.translatesAutoresizingMaskIntoConstraints = false
         rootView.addSubview(contentStack)
 
@@ -341,46 +387,94 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             headerStack,
             titleLabel,
             subtitleLabel,
+            selectionDetails,
             selectorStack,
             volumeDetailLabel,
             smartDetailLabel,
             connectionPathLabel,
             unlockProgressLabel,
-            optionStack,
             statusLabel,
-            actionLabel,
+            inspectionStack,
+            operationsStack,
+            operationButtons,
             actionStack,
-            utilityButtonStack,
+            reportHeader,
             scrollView
         ].forEach {
             $0.translatesAutoresizingMaskIntoConstraints = false
         }
 
         NSLayoutConstraint.activate([
-            contentStack.topAnchor.constraint(equalTo: rootView.topAnchor, constant: 20),
+            contentStack.topAnchor.constraint(equalTo: rootView.topAnchor, constant: 18),
             contentStack.leadingAnchor.constraint(equalTo: rootView.leadingAnchor, constant: 20),
             contentStack.trailingAnchor.constraint(equalTo: rootView.trailingAnchor, constant: -20),
-            contentStack.bottomAnchor.constraint(equalTo: rootView.bottomAnchor, constant: -20),
-            logoImageView.widthAnchor.constraint(equalToConstant: 72),
-            logoImageView.heightAnchor.constraint(equalToConstant: 72),
+            contentStack.bottomAnchor.constraint(equalTo: rootView.bottomAnchor, constant: -18),
+            logoImageView.widthAnchor.constraint(equalToConstant: 48),
+            logoImageView.heightAnchor.constraint(equalToConstant: 48),
             headerStack.widthAnchor.constraint(equalTo: contentStack.widthAnchor),
             titleLabel.widthAnchor.constraint(equalTo: titleStack.widthAnchor),
             subtitleLabel.widthAnchor.constraint(equalTo: titleStack.widthAnchor),
-            selectorStack.widthAnchor.constraint(equalTo: contentStack.widthAnchor),
-            volumeDetailLabel.widthAnchor.constraint(equalTo: contentStack.widthAnchor),
-            smartDetailLabel.widthAnchor.constraint(equalTo: contentStack.widthAnchor),
-            connectionPathLabel.widthAnchor.constraint(equalTo: contentStack.widthAnchor),
-            unlockProgressLabel.widthAnchor.constraint(equalTo: contentStack.widthAnchor),
-            optionStack.widthAnchor.constraint(equalTo: contentStack.widthAnchor),
-            statusLabel.widthAnchor.constraint(equalTo: contentStack.widthAnchor),
+            selectionDetails.widthAnchor.constraint(equalTo: contentStack.widthAnchor),
+            selectorStack.widthAnchor.constraint(equalTo: selectionDetails.widthAnchor),
+            volumeDetailLabel.widthAnchor.constraint(equalTo: selectionDetails.widthAnchor),
+            smartDetailLabel.widthAnchor.constraint(equalTo: selectionDetails.widthAnchor),
+            connectionPathLabel.widthAnchor.constraint(equalTo: selectionDetails.widthAnchor),
+            unlockProgressLabel.widthAnchor.constraint(equalTo: selectionDetails.widthAnchor),
+            statusLabel.widthAnchor.constraint(equalTo: selectionDetails.widthAnchor),
             actionStack.widthAnchor.constraint(lessThanOrEqualTo: contentStack.widthAnchor),
-            utilityButtonStack.widthAnchor.constraint(lessThanOrEqualTo: contentStack.widthAnchor),
+            reportHeader.widthAnchor.constraint(equalTo: contentStack.widthAnchor),
             scrollView.widthAnchor.constraint(equalTo: contentStack.widthAnchor),
-            scrollView.heightAnchor.constraint(greaterThanOrEqualToConstant: 360)
+            scrollView.heightAnchor.constraint(greaterThanOrEqualToConstant: 120)
         ])
 
         window.makeKeyAndOrderFront(nil)
         self.window = window
+    }
+
+    func toolbarDefaultItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
+        [WorkbenchToolbarItem.refresh, WorkbenchToolbarItem.stop, .flexibleSpace, WorkbenchToolbarItem.reveal]
+    }
+
+    func toolbarAllowedItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
+        toolbarDefaultItemIdentifiers(toolbar)
+    }
+
+    func toolbar(
+        _ toolbar: NSToolbar,
+        itemForItemIdentifier itemIdentifier: NSToolbarItem.Identifier,
+        willBeInsertedIntoToolbar flag: Bool
+    ) -> NSToolbarItem? {
+        let button: NSButton
+        let symbolName: String
+        switch itemIdentifier {
+        case WorkbenchToolbarItem.refresh:
+            guard let refreshButton else { return nil }
+            button = refreshButton
+            symbolName = "arrow.clockwise"
+        case WorkbenchToolbarItem.stop:
+            guard let stopButton else { return nil }
+            button = stopButton
+            symbolName = "stop.fill"
+        case WorkbenchToolbarItem.reveal:
+            guard let revealButton else { return nil }
+            button = revealButton
+            symbolName = "externaldrive"
+        default:
+            return nil
+        }
+
+        button.controlSize = .small
+        button.setAccessibilityLabel(button.title)
+        button.toolTip = button.title
+        if let image = NSImage(systemSymbolName: symbolName, accessibilityDescription: button.title) {
+            button.image = image
+            button.imagePosition = .imageOnly
+        }
+        let item = NSToolbarItem(itemIdentifier: itemIdentifier)
+        item.label = button.title
+        item.paletteLabel = button.title
+        item.view = button
+        return item
     }
 
     private func startDiskMonitoring() {
@@ -875,7 +969,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
         let requiresReadOnlyRemount = nonEmpty(volume.mountPoint) != nil && volume.isWritable == true
-        if requiresReadOnlyRemount && !confirmReadOnlyRemount(volume: volume) {
+        let confirmed: Bool = requiresReadOnlyRemount
+            ? confirmReadOnlyRemount(volume: volume)
+            : confirmDiskAction(
+                title: "Mount \(volume.name) read-only?",
+                explanation: "macOS will mount only the selected volume read-only and verify that it is not writable.",
+                buttonTitle: "Mount Read-Only"
+            )
+        guard confirmed else {
             return
         }
 
@@ -892,6 +993,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard volumeActionAvailability(for: volume).mountNormally else {
             return
         }
+        guard confirmDiskAction(
+            title: "Mount \(volume.name) normally?",
+            explanation: "macOS will mount only the selected volume using its normal write policy.",
+            buttonTitle: "Mount Normally"
+        ) else {
+            return
+        }
 
         beginOperation(status: "Mounting \(volume.name) normally…")
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
@@ -904,6 +1012,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
         guard volumeActionAvailability(for: volume).unmountVolume else {
+            return
+        }
+        guard confirmDiskAction(
+            title: "Unmount \(volume.name)?",
+            explanation: "macOS will unmount only the selected volume. Close files using it first.",
+            buttonTitle: "Unmount Volume"
+        ) else {
             return
         }
 
@@ -923,11 +1038,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func confirmReadOnlyRemount(volume: ExternalVolume) -> Bool {
+        confirmDiskAction(
+            title: "Remount \(volume.name) read-only?",
+            explanation: "The selected volume is currently mounted writable. macOS must unmount only this volume before mounting it read-only. Close files using it first.",
+            buttonTitle: "Unmount and Remount"
+        )
+    }
+
+    private func confirmDiskAction(title: String, explanation: String, buttonTitle: String) -> Bool {
         let alert = NSAlert()
-        alert.messageText = "Remount \(volume.name) read-only?"
-        alert.informativeText = "The selected volume is currently mounted writable. macOS must unmount only this volume before mounting it read-only. Close files using it first."
+        alert.messageText = title
+        alert.informativeText = explanation
         alert.alertStyle = .warning
-        alert.addButton(withTitle: "Unmount and Remount")
+        alert.addButton(withTitle: buttonTitle)
         alert.addButton(withTitle: "Cancel")
         return alert.runModal() == .alertFirstButtonReturn
     }
@@ -950,13 +1073,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard volumeActionAvailability(for: volume).safeEjectDisk else {
             return
         }
-        let alert = NSAlert()
-        alert.messageText = "Safely eject /dev/\(volume.wholeDiskIdentifier)?"
-        alert.informativeText = "This ejects the whole external physical disk, including any sibling volumes. Close files using them first."
-        alert.alertStyle = .warning
-        alert.addButton(withTitle: "Safe Eject Disk")
-        alert.addButton(withTitle: "Cancel")
-        guard alert.runModal() == .alertFirstButtonReturn else {
+        guard confirmDiskAction(
+            title: "Safely eject /dev/\(volume.wholeDiskIdentifier)?",
+            explanation: "This ejects the whole external physical disk, including any sibling volumes. Close files using them first.",
+            buttonTitle: "Safe Eject Disk"
+        ) else {
             return
         }
 
@@ -1486,7 +1607,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         textView.textStorage?.append(NSAttributedString(string: text, attributes: [
             .font: NSFont.monospacedSystemFont(ofSize: 12, weight: .regular),
-            .foregroundColor: NSColor(calibratedRed: 0.78, green: 0.94, blue: 0.80, alpha: 1)
+            .foregroundColor: NSColor.labelColor
         ]))
         textView.scrollToEndOfDocument(nil)
     }
