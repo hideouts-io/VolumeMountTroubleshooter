@@ -645,6 +645,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
                         self.finishSupersededScan()
                         return
                     }
+                    guard !self.scanRunner.isCancelled() else {
+                        self.finishCancelledScan(generation: currentScanGeneration)
+                        return
+                    }
                     self.applySnapshot(
                         newSnapshot,
                         selectedIdentifier: selectedIdentifier,
@@ -652,25 +656,62 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
                         automatic: automatic
                     )
                 }
+            } catch TroubleshooterError.cancelled {
+                DispatchQueue.main.async {
+                    self?.finishCancelledScan(generation: currentScanGeneration)
+                }
             } catch {
                 DispatchQueue.main.async {
                     guard let self else {
                         return
                     }
+                    switch error {
+                    case TroubleshooterError.commandTerminationFailed, TroubleshooterError.commandOutputFailed:
+                        self.refreshWorkItem?.cancel()
+                        self.refreshWorkItem = nil
+                        self.unlockRetryWorkItem?.cancel()
+                        self.unlockRetryWorkItem = nil
+                        self.automaticRefreshPending = false
+                        self.postRefreshStatus = nil
+                        self.showScanFailure(error: error)
+                        return
+                    default:
+                        break
+                    }
                     guard self.scanGeneration == currentScanGeneration else {
                         self.finishSupersededScan()
                         return
                     }
-                    self.isRefreshing = false
-                    self.refreshButton?.isEnabled = true
-                    self.setStatus("Volume scan failed: \(error.localizedDescription)", color: .systemRed)
-                    self.appendLog("SCAN FAILURE: \(error.localizedDescription)\n")
+                    guard !self.scanRunner.isCancelled() else {
+                        self.finishCancelledScan(generation: currentScanGeneration)
+                        return
+                    }
+                    self.showScanFailure(error: error)
                     self.updateUnlockTransition()
-                    self.setControlsForRunningState(self.isRunning)
                     self.runPendingAutomaticRefreshIfNeeded()
                 }
             }
         }
+    }
+
+    private func showScanFailure(error: Error) {
+        isRefreshing = false
+        setStatus("Volume scan failed: \(error.localizedDescription)", color: .systemRed)
+        appendLog("SCAN FAILURE: \(error.localizedDescription)\n")
+        setControlsForRunningState(isRunning)
+    }
+
+    private func finishCancelledScan(generation: Int) {
+        guard scanGeneration == generation else {
+            finishSupersededScan()
+            return
+        }
+        isRefreshing = false
+        automaticRefreshPending = false
+        postRefreshStatus = nil
+        setControlsForRunningState(isRunning)
+        setStatus("Volume scan cancelled — press Refresh to try again", color: .systemOrange)
+        appendLog("\nRESULT: CANCELLED — volume scan stopped\n")
     }
 
     private func finishSupersededScan() {
@@ -1056,7 +1097,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
     }
 
     @objc private func stopTroubleshooting() {
+        automaticRefreshPending = false
+        refreshWorkItem?.cancel()
+        refreshWorkItem = nil
+        unlockRetryWorkItem?.cancel()
+        unlockRetryWorkItem = nil
         runner.cancel()
+        scanRunner.cancel()
+        stopButton?.isEnabled = false
         appendLog("\nStop requested. Terminating the active command…\n")
         setStatus("Stopping…", color: .systemOrange)
     }
@@ -1627,7 +1675,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
         mountReadOnlyButton?.isEnabled = actionsEnabled && availability.mountReadOnly
         mountNormallyButton?.isEnabled = actionsEnabled && availability.mountNormally
         unmountButton?.isEnabled = actionsEnabled && availability.unmountVolume
-        stopButton?.isEnabled = running
+        stopButton?.isEnabled = running || isRefreshing
         refreshButton?.isEnabled = !running && !isRefreshing
         ejectButton?.isEnabled = actionsEnabled && availability.safeEjectDisk
         let hasUnlockerMountPoint = nonEmpty(trackedUnlocker?.mountPoint) != nil
