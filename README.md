@@ -140,7 +140,7 @@ The app separates inspection, mounting, and whole-device ejection.
 | Safe Eject Disk | Selected volume's whole physical disk | Ejects the disk and sibling volumes | Additional warning dialog |
 | Save Report | User-selected destination | Writes one text report | Standard save dialog |
 
-The application never constructs or runs repair, erase, partition, format, force-eject, unlock, or `sudo` commands. A failed mount remains a failure with its original output visible; the app does not silently switch to a different mode.
+The application never constructs or runs repair, erase, partition, format, force-eject, unlock, or `sudo` commands. A nonzero mount exit and its original output remain visible; the app does not silently switch to a different mode.
 
 ---
 
@@ -335,7 +335,7 @@ If the selected volume is already mounted writable, macOS cannot convert that li
 /usr/sbin/diskutil mount readOnly /dev/diskNsN
 ```
 
-After either mode, the app decodes fresh `diskutil info -plist` output. Success requires a non-empty mount point. Read-only success additionally requires macOS to report that the mounted volume is not writable.
+After either mode, the app decodes fresh `diskutil info -plist` output and verifies that it still belongs to the selected media. Success requires a non-empty mount point. Read-only success additionally requires macOS to report that the mounted volume is not writable. Unmount success requires the same selected volume to have no mount point. If the final state cannot be verified, the result says **Unverified** and asks the user to check Disk Utility. A failure to collect recent Disk Arbitration logs is reported separately from the storage action.
 
 **Unmount Volume** is enabled only while the selected volume is mounted and targets that volume alone:
 
