@@ -140,7 +140,7 @@ private func transportTestVolume(identifier: String, stores: [String]) -> Extern
     )
 }
 
-/// Evaluates controlled postconditions only; physical mount, unmount and eject behavior needs separate hardware acceptance.
+/// Checks controlled postconditions and empty native registry matches without changing storage state.
 func runStorageActionOutcomeSelfTests() -> Bool {
     let unmounted = storageActionTestVolume(mountPoint: nil, writable: false)
     let readOnly = storageActionTestVolume(mountPoint: "/Volumes/Controlled", writable: false)
@@ -172,8 +172,21 @@ func runStorageActionOutcomeSelfTests() -> Bool {
         (unmountOutcome(exitStatus: 7, observation: .verified(unmounted)), .unverified),
         (unmountOutcome(exitStatus: 7, observation: unavailable), .unverified)
     ]
-    return cases.allSatisfy { result, expected in
+    guard cases.allSatisfy({ result, expected in
         result.outcome == expected
+    }) else {
+        return false
+    }
+    do {
+        let presence = try TransportScanner(runner: CommandRunner()).selectedMediaPresence(
+            diskIdentifier: "disk99999",
+            expectedRegistryEntryID: UInt64.max
+        )
+        // An unrelated disk using the synthetic name cannot represent the unknown original identity.
+        return presence == .absent || presence == .replaced
+    } catch {
+        FileHandle.standardError.write(Data("Read-only media-absence check failed: \(error.localizedDescription)\n".utf8))
+        return false
     }
 }
 

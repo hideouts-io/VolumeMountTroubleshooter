@@ -150,6 +150,8 @@ final class TransportScanner {
         }
         var iterator: io_iterator_t = 0
         try checkStatus(IOServiceGetMatchingServices(kIOMainPortDefault, match, &iterator), operation: "matching captured IOMedia identity")
+        // A successful null iterator denotes an empty match, not an invalidated iteration.
+        guard iterator != 0 else { return nil }
         defer { IOObjectRelease(iterator) }
         let media = IOIteratorNext(iterator)
         guard media != 0 else {
@@ -186,6 +188,7 @@ final class TransportScanner {
         }
         var iterator: io_iterator_t = 0
         try checkStatus(IOServiceGetMatchingServices(kIOMainPortDefault, match, &iterator), operation: "matching /dev/\(diskIdentifier)")
+        guard iterator != 0 else { return nil }
         defer { IOObjectRelease(iterator) }
         let media = IOIteratorNext(iterator)
         guard media != 0 else {
