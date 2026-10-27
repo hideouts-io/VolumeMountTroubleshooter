@@ -46,6 +46,26 @@ func runTransportSelfTests() -> Bool {
     else {
         return false
     }
+    guard
+        ejectOutcome(exitStatus: 0, mediaPresence: .absent) == .success,
+        ejectOutcome(exitStatus: 0, mediaPresence: .same) == .unverified,
+        ejectOutcome(exitStatus: 0, mediaPresence: .replaced) == .unverified,
+        ejectOutcome(exitStatus: 0, mediaPresence: .unavailable("lookup failed")) == .unverified,
+        ejectOutcome(exitStatus: 1, mediaPresence: .same) == .failed,
+        ejectOutcome(exitStatus: 1, mediaPresence: .absent) == .unverified,
+        ejectOutcome(exitStatus: 1, mediaPresence: .replaced) == .unverified,
+        ["disk4", "disk4s2", "disk8", "disk8s1"].allSatisfy({
+            expectedEjectDisappearance(identifier: $0, volume: apfsVolume, disk: disk, phase: .inFlight)
+        }),
+        ["disk40", "disk5", "disk8s2"].allSatisfy({
+            !expectedEjectDisappearance(identifier: $0, volume: apfsVolume, disk: disk, phase: .inFlight)
+        }),
+        !expectedEjectDisappearance(identifier: "disk4", volume: apfsVolume, disk: disk, phase: .preflight),
+        !expectedEjectDisappearance(identifier: "disk4", volume: apfsVolume, disk: disk, phase: .launching),
+        !expectedEjectDisappearance(identifier: "disk8s1", volume: apfsVolume, disk: disk, phase: .stopped)
+    else {
+        return false
+    }
     for stores in [["disk40s2"], ["disk4s2", "disk6s2"], [], ["disk4s2", "disk4s2"]] {
         guard case .unavailable = selectedPhysicalTransport(volume: transportTestVolume(identifier: "disk8s1", stores: stores), disk: disk) else {
             return false

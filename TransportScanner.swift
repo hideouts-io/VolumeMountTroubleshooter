@@ -39,6 +39,33 @@ final class TransportScanner {
         return identifier
     }
 
+    /// Checks the captured whole-disk IOMedia, not the USB bridge that may remain after ejection.
+    func selectedMediaPresence(diskIdentifier: String, expectedRegistryEntryID: UInt64) throws -> SelectedMediaPresence {
+        guard wholeDiskIdentifier(forPhysicalStore: diskIdentifier) == diskIdentifier else {
+            throw TransportScanError.invalidObservation(reason: "a validated whole-disk BSD identifier is required")
+        }
+        let deadline = ProcessInfo.processInfo.systemUptime + 5
+        try checkCollectionDeadline(deadline)
+        if let original = try matchingRegistryEntryIfPresent(expectedRegistryEntryID) {
+            IOObjectRelease(original)
+            try checkCollectionDeadline(deadline)
+            return .same
+        }
+        if let current = try matchingMediaIfPresent(diskIdentifier) {
+            defer { IOObjectRelease(current) }
+            let currentID = try entryID(current)
+            try checkCollectionDeadline(deadline)
+            return currentID == expectedRegistryEntryID ? .same : .replaced
+        }
+        if let original = try matchingRegistryEntryIfPresent(expectedRegistryEntryID) {
+            IOObjectRelease(original)
+            try checkCollectionDeadline(deadline)
+            return .same
+        }
+        try checkCollectionDeadline(deadline)
+        return .absent
+    }
+
     func scan(
         diskIdentifier: String,
         busProtocol: String,
@@ -111,6 +138,49 @@ final class TransportScanner {
     }
 
     private func matchingMedia(_ diskIdentifier: String) throws -> io_registry_entry_t {
+        guard let media = try matchingMediaIfPresent(diskIdentifier) else {
+            throw TransportScanError.invalidObservation(reason: "no current IOMedia publishes /dev/\(diskIdentifier)")
+        }
+        return media
+    }
+
+    private func matchingRegistryEntryIfPresent(_ registryEntryID: UInt64) throws -> io_registry_entry_t? {
+        guard let match = IORegistryEntryIDMatching(registryEntryID) else {
+            throw TransportScanError.invalidObservation(reason: "the captured IOMedia identity lookup could not be created")
+        }
+        var iterator: io_iterator_t = 0
+        try checkStatus(IOServiceGetMatchingServices(kIOMainPortDefault, match, &iterator), operation: "matching captured IOMedia identity")
+        defer { IOObjectRelease(iterator) }
+        let media = IOIteratorNext(iterator)
+        guard media != 0 else {
+            guard IOIteratorIsValid(iterator) != 0 else {
+                throw TransportScanError.invalidObservation(reason: "the captured IOMedia lookup was invalidated")
+            }
+            return nil
+        }
+        let additional = IOIteratorNext(iterator)
+        if additional != 0 {
+            IOObjectRelease(additional)
+            IOObjectRelease(media)
+            throw TransportScanError.invalidObservation(reason: "the captured IOMedia identity matched multiple services")
+        }
+        do {
+            guard
+                IOIteratorIsValid(iterator) != 0,
+                IOObjectConformsTo(media, "IOMedia") != 0,
+                try booleanProperty(media, key: "Whole") == true,
+                try entryID(media) == registryEntryID
+            else {
+                throw TransportScanError.invalidObservation(reason: "the captured identity no longer denotes a current whole-disk IOMedia")
+            }
+            return media
+        } catch {
+            IOObjectRelease(media)
+            throw error
+        }
+    }
+
+    private func matchingMediaIfPresent(_ diskIdentifier: String) throws -> io_registry_entry_t? {
         guard let match = IOBSDNameMatching(kIOMainPortDefault, 0, diskIdentifier) else {
             throw TransportScanError.invalidObservation(reason: "IOBSDNameMatching could not create the disk lookup")
         }
@@ -119,7 +189,10 @@ final class TransportScanner {
         defer { IOObjectRelease(iterator) }
         let media = IOIteratorNext(iterator)
         guard media != 0 else {
-            throw TransportScanError.invalidObservation(reason: "no current IOMedia publishes /dev/\(diskIdentifier)")
+            guard IOIteratorIsValid(iterator) != 0 else {
+                throw TransportScanError.invalidObservation(reason: "the selected-media lookup was invalidated")
+            }
+            return nil
         }
         let additional = IOIteratorNext(iterator)
         if additional != 0 {

@@ -12,6 +12,13 @@ private enum StorageStateObservation {
     case unavailable(String)
 }
 
+private struct ActiveEject {
+    let generation: Int
+    let volume: ExternalVolume
+    let disk: ExternalDisk
+    var phase: EjectPhase
+}
+
 private enum WorkbenchToolbarItem {
     static let refresh = NSToolbarItem.Identifier("refresh")
     static let stop = NSToolbarItem.Identifier("stop")
@@ -50,6 +57,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
     private var revealButton: NSButton?
     private var completeLog = ""
     private var isRunning = false
+    private var operationGeneration = 0
+    private var activeEject: ActiveEject?
     private var isRefreshing = false
     private var scanGeneration = 0
     private var automaticRefreshPending = false
@@ -514,11 +523,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
         let trackedUnlockerWasRemoved = trackedUnlocker.map { unlocker in
             !updatedSnapshot.unlockers.contains(unlocker)
         } ?? false
+        let isExpectedEjectDisappearance = selectedWasRemoved && isRunning && activeEject.map { eject in
+            let phase = eject.phase == .launching && runner.isActiveCommand(
+                executable: "/usr/sbin/diskutil",
+                arguments: ["eject", "/dev/\(eject.disk.identifier)"]
+            ) ? EjectPhase.inFlight : eject.phase
+            return eject.generation == operationGeneration && expectedEjectDisappearance(
+                identifier: identifier,
+                volume: eject.volume,
+                disk: eject.disk,
+                phase: phase
+            )
+        } == true
         if selectedWasRemoved {
             selectionRequiresUserChoice = true
             if isRunning {
-                runner.cancel()
-                appendLog("SELECTED STORAGE DISCONNECTED: stopping the operation; select the device again after it reappears.\n")
+                if isExpectedEjectDisappearance {
+                    appendLog("EJECT TRANSITION: selected storage disappeared; awaiting the eject command result and original-media verification.\n")
+                } else {
+                    runner.cancel()
+                    appendLog("SELECTED STORAGE DISCONNECTED: stopping the operation; select the device again after it reappears.\n")
+                }
             }
         }
 
@@ -541,7 +566,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
         updateSelectionDetails()
         setControlsForRunningState(isRunning)
         if selectedWasRemoved {
-            setStatus("Selected storage disconnected — choose the volume again", color: .systemOrange)
+            if !isExpectedEjectDisappearance {
+                setStatus("Selected storage disconnected — choose the volume again", color: .systemOrange)
+            }
             if !isRunning {
                 appendLog("SELECTED STORAGE DISCONNECTED: /dev/\(identifier) disappeared; the selected volume was cleared.\n")
             }
@@ -1074,6 +1101,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
     }
 
     private func beginOperation(status: String) {
+        operationGeneration += 1
+        activeEject = nil
         isRunning = true
         completeLog = ""
         textView?.string = ""
@@ -1106,6 +1135,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
         refreshWorkItem = nil
         unlockRetryWorkItem?.cancel()
         unlockRetryWorkItem = nil
+        activeEject?.phase = .stopped
         runner.cancel()
         scanRunner.cancel()
         stopButton?.isEnabled = false
@@ -1134,32 +1164,179 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
         }
 
         beginOperation(status: "Ejecting external disk…")
+        let generation = operationGeneration
+        activeEject = ActiveEject(
+            generation: generation,
+            volume: volume,
+            disk: disk,
+            phase: .preflight
+        )
         let devicePath = "/dev/\(volume.wholeDiskIdentifier)"
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            guard let self else {
+            self?.performEject(volume: volume, disk: disk, devicePath: devicePath, generation: generation)
+        }
+    }
+
+    nonisolated private func performEject(
+        volume: ExternalVolume,
+        disk: ExternalDisk,
+        devicePath: String,
+        generation: Int
+    ) {
+        postOperationHeader(action: "Safe Eject Disk", volume: volume, disk: disk)
+        var mutationRequested = false
+        do {
+            _ = try validatedSelectedVolume(volume: volume, disk: disk, runner: runner)
+            guard case let .observed(expectedID) = disk.mediaIdentity else {
+                throw TroubleshooterError.selectedStorageChanged(reason: "the selected disk has no captured IOMedia identity")
+            }
+            try markEjectLaunching(generation: generation)
+            let result = try runLogged(
+                executable: "/usr/sbin/diskutil",
+                arguments: ["eject", devicePath],
+                runner: runner,
+                onLaunch: { [weak self] in
+                    mutationRequested = true
+                    self?.markEjectCommandStarted(generation: generation)
+                }
+            )
+            let presence = observeEjectedMedia(
+                diskIdentifier: disk.identifier,
+                expectedRegistryEntryID: expectedID,
+                runner: runner
+            )
+            postEjectObservation(presence, devicePath: devicePath)
+            appendOptionalDiskArbitrationErrors(volume: volume, runner: runner)
+            if result.exitStatus != 0 {
+                postLog(guidedFailureExplanation(exitStatus: result.exitStatus, output: result.output, volume: volume) + "\n")
+            }
+            let outcome = ejectOutcome(exitStatus: result.exitStatus, mediaPresence: presence)
+            let message: String
+            switch outcome {
+            case .success:
+                message = "Safely ejected \(devicePath); original media is absent"
+            case .failed:
+                message = "Eject command exited \(result.exitStatus); original media is still present"
+            case .unverified:
+                message = "Eject command exited \(result.exitStatus); final state of the original media is unverified"
+            }
+            postEjectCompletion(generation: generation, outcome: outcome, message: message, mutationRequested: true)
+        } catch TroubleshooterError.cancelled {
+            if mutationRequested {
+                postEjectCompletion(
+                    generation: generation,
+                    outcome: .unverified,
+                    message: "Stopped after the eject command was requested; verify the disk state",
+                    mutationRequested: true
+                )
+            } else {
+                postEjectCompletion(generation: generation, outcome: nil, message: "Operation stopped before eject", mutationRequested: false)
+            }
+        } catch {
+            postLog("FATAL: \(error.localizedDescription)\n")
+            postEjectCompletion(
+                generation: generation,
+                outcome: mutationRequested ? .unverified : .failed,
+                message: mutationRequested
+                    ? "Eject command outcome unknown: \(error.localizedDescription)"
+                    : error.localizedDescription,
+                mutationRequested: mutationRequested
+            )
+        }
+    }
+
+    nonisolated private func markEjectLaunching(generation: Int) throws {
+        let ready = DispatchQueue.main.sync { [weak self] in
+            guard let self, var eject = self.activeEject,
+                  eject.generation == generation, self.isRunning, eject.phase == .preflight else {
+                return false
+            }
+            eject.phase = .launching
+            self.activeEject = eject
+            return true
+        }
+        guard ready else {
+            throw TroubleshooterError.cancelled
+        }
+    }
+
+    nonisolated private func markEjectCommandStarted(generation: Int) {
+        DispatchQueue.main.sync { [weak self] in
+            guard let self, var eject = self.activeEject,
+                  eject.generation == generation, self.isRunning, eject.phase == .launching else {
                 return
             }
-            self.postOperationHeader(action: "Safe Eject Disk", volume: volume, disk: disk)
-            do {
-                _ = try self.validatedSelectedVolume(volume: volume, disk: disk, runner: self.runner)
-                let result = try self.runLogged(
-                    executable: "/usr/sbin/diskutil",
-                    arguments: ["eject", devicePath],
-                    runner: self.runner
-                )
-                if result.exitStatus == 0 {
-                    self.finishSuccess("Safely ejected \(devicePath)")
-                } else {
-                    self.postLog(guidedFailureExplanation(exitStatus: result.exitStatus, output: result.output, volume: volume) + "\n")
-                    self.finishFailure("Eject failed for \(devicePath)")
-                }
-            } catch TroubleshooterError.cancelled {
-                self.finishCancelled()
-            } catch {
-                self.postLog("FATAL: \(error.localizedDescription)\n")
-                self.finishFailure(error.localizedDescription)
-            }
+            eject.phase = .inFlight
+            self.activeEject = eject
+        }
+    }
+
+    nonisolated private func observeEjectedMedia(
+        diskIdentifier: String,
+        expectedRegistryEntryID: UInt64,
+        runner: CommandRunner
+    ) -> SelectedMediaPresence {
+        postCollectionStep("IOKit: verify original IOMedia for /dev/\(diskIdentifier) after eject")
+        do {
+            return try TransportScanner(runner: runner).selectedMediaPresence(
+                diskIdentifier: diskIdentifier,
+                expectedRegistryEntryID: expectedRegistryEntryID
+            )
+        } catch {
+            return .unavailable(error.localizedDescription)
+        }
+    }
+
+    nonisolated private func postEjectObservation(_ presence: SelectedMediaPresence, devicePath: String) {
+        switch presence {
+        case .absent:
+            postLog("POSTCONDITION OBSERVED: the original whole-disk IOMedia is absent from \(devicePath).\n")
+        case .same:
+            postLog("POSTCONDITION OBSERVED: the original whole-disk IOMedia remains active.\n")
+        case .replaced:
+            postLog("POSTCONDITION UNKNOWN: \(devicePath) now names different whole-disk media; the original device may have disappeared or been replaced.\n")
+        case let .unavailable(reason):
+            postLog("POSTCONDITION UNKNOWN: could not verify original whole-disk media: \(reason)\n")
+        }
+    }
+
+    nonisolated private func postEjectCompletion(
+        generation: Int,
+        outcome: EjectOutcome?,
+        message: String,
+        mutationRequested: Bool
+    ) {
+        DispatchQueue.main.async { [weak self] in
+            self?.completeEject(generation: generation, outcome: outcome, message: message, mutationRequested: mutationRequested)
+        }
+    }
+
+    private func completeEject(
+        generation: Int,
+        outcome: EjectOutcome?,
+        message: String,
+        mutationRequested: Bool
+    ) {
+        guard let eject = activeEject, eject.generation == generation else {
+            return
+        }
+        activeEject = nil
+        let finalOutcome = eject.phase == .stopped && mutationRequested ? .unverified : outcome
+        switch finalOutcome {
+        case .success:
+            appendLog("\nRESULT: SUCCESS — \(message)\n")
+            finish(message, color: .systemGreen)
+        case .failed:
+            appendLog("\nRESULT: FAILED — \(message)\n")
+            finish(message, color: .systemRed)
+        case .unverified:
+            let reason = eject.phase == .stopped ? "Stop was requested during eject; verify the original disk state" : message
+            appendLog("\nRESULT: UNVERIFIED — \(reason). Check the disk in Disk Utility before another action.\n")
+            finish("Eject outcome unverified — check Disk Utility", color: .systemOrange)
+        case nil:
+            appendLog("\nRESULT: CANCELLED — \(message)\n")
+            finish("Cancelled", color: .systemOrange)
         }
     }
 
@@ -1682,15 +1859,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
         arguments: [String],
         runner: CommandRunner
     ) throws -> CommandResult {
+        try runLogged(executable: executable, arguments: arguments, runner: runner, onLaunch: {})
+    }
+
+    nonisolated private func runLogged(
+        executable: String,
+        arguments: [String],
+        runner: CommandRunner,
+        onLaunch: () -> Void
+    ) throws -> CommandResult {
         let command = renderedCommand(executable: executable, arguments: arguments)
         postLog("$ \(command)\n")
         let result = try runner.run(
             executable: executable,
             arguments: arguments,
-            timeoutSeconds: 30
-        ) { [weak self] chunk in
-            self?.postLog(chunk)
-        }
+            timeoutSeconds: 30,
+            onLaunch: onLaunch,
+            onOutput: { [weak self] chunk in
+                self?.postLog(chunk)
+            }
+        )
         if !result.output.hasSuffix("\n") {
             postLog("\n")
         }

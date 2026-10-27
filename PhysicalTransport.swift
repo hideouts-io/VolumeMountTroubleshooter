@@ -65,6 +65,53 @@ enum PhysicalMediaIdentity: Hashable, Sendable {
     case unavailable(reason: String)
 }
 
+enum SelectedMediaPresence: Equatable {
+    case absent
+    case same
+    case replaced
+    case unavailable(String)
+}
+
+enum EjectOutcome: Equatable {
+    case success
+    case failed
+    case unverified
+}
+
+enum EjectPhase: Equatable {
+    case preflight
+    case launching
+    case inFlight
+    case stopped
+}
+
+func ejectOutcome(exitStatus: Int32, mediaPresence: SelectedMediaPresence) -> EjectOutcome {
+    switch (exitStatus, mediaPresence) {
+    case (0, .absent):
+        return .success
+    case (_, .same) where exitStatus != 0:
+        return .failed
+    default:
+        return .unverified
+    }
+}
+
+func expectedEjectDisappearance(
+    identifier: String,
+    volume: ExternalVolume,
+    disk: ExternalDisk,
+    phase: EjectPhase
+) -> Bool {
+    guard phase == .inFlight else {
+        return false
+    }
+    return deviceIdentifier(volume.identifier, isSameAsOrDescendantOf: identifier)
+        || deviceIdentifier(disk.identifier, isSameAsOrDescendantOf: identifier)
+        || volume.physicalStoreIdentifiers.contains {
+            deviceIdentifier($0, isSameAsOrDescendantOf: identifier)
+        }
+}
+
 /// Accepts only BSD whole disks or their partitions; names and prefixes never establish association.
 func wholeDiskIdentifier(forPhysicalStore identifier: String) -> String? {
     guard identifier.count <= 64 else {

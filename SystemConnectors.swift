@@ -75,10 +75,35 @@ final class CommandRunner: @unchecked Sendable {
         return result
     }
 
+    func isActiveCommand(executable: String, arguments: [String]) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard commandInProgress, let process = currentProcess else {
+            return false
+        }
+        return process.executableURL?.path == executable && process.arguments == arguments
+    }
+
     func run(
         executable: String,
         arguments: [String],
         timeoutSeconds: TimeInterval,
+        onOutput: @escaping (String) -> Void
+    ) throws -> CommandResult {
+        try run(
+            executable: executable,
+            arguments: arguments,
+            timeoutSeconds: timeoutSeconds,
+            onLaunch: {},
+            onOutput: onOutput
+        )
+    }
+
+    func run(
+        executable: String,
+        arguments: [String],
+        timeoutSeconds: TimeInterval,
+        onLaunch: () -> Void,
         onOutput: @escaping (String) -> Void
     ) throws -> CommandResult {
         let process = Process()
@@ -154,6 +179,7 @@ final class CommandRunner: @unchecked Sendable {
                 reason: error.localizedDescription
             )
         }
+        onLaunch()
 
         let outputBuffer = CommandOutputBuffer()
         var failure = collectCommandOutput(
@@ -327,6 +353,41 @@ func runCommandRunnerSelfTests() -> Bool {
         guard failure.exitStatus == 7, failure.output == "specific command failure\n" else {
             try fileManager.removeItem(at: directory)
             return false
+        }
+        var launchCount = 0
+        var activeCommandWasPublished = false
+        let launched = try runner.run(
+            executable: "/usr/bin/true",
+            arguments: [],
+            timeoutSeconds: 5,
+            onLaunch: {
+                launchCount += 1
+                activeCommandWasPublished = runner.isActiveCommand(executable: "/usr/bin/true", arguments: [])
+            },
+            onOutput: { _ in }
+        )
+        guard launched.exitStatus == 0, launchCount == 1, activeCommandWasPublished else {
+            try fileManager.removeItem(at: directory)
+            return false
+        }
+        let preCancelledRunner = CommandRunner()
+        preCancelledRunner.cancel()
+        var cancelledLaunchCount = 0
+        do {
+            _ = try preCancelledRunner.run(
+                executable: "/usr/bin/true",
+                arguments: [],
+                timeoutSeconds: 5,
+                onLaunch: { cancelledLaunchCount += 1 },
+                onOutput: { _ in }
+            )
+            try fileManager.removeItem(at: directory)
+            return false
+        } catch TroubleshooterError.cancelled {
+            guard cancelledLaunchCount == 0 else {
+                try fileManager.removeItem(at: directory)
+                return false
+            }
         }
         do {
             _ = try runner.run(
