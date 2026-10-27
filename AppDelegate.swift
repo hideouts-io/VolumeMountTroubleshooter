@@ -4,8 +4,14 @@ import UniformTypeIdentifiers
 
 private struct MountRequestOutcome {
     let mountResult: CommandResult
-    let verificationResult: CommandResult
-    let currentInfo: DiskInfoPropertyList?
+    let postcondition: StorageStateObservation
+}
+
+private struct ActiveEject {
+    let generation: Int
+    let volume: ExternalVolume
+    let disk: ExternalDisk
+    var phase: EjectPhase
 }
 
 private enum WorkbenchToolbarItem {
@@ -46,6 +52,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
     private var revealButton: NSButton?
     private var completeLog = ""
     private var isRunning = false
+    private var operationGeneration = 0
+    private var activeEject: ActiveEject?
     private var isRefreshing = false
     private var scanGeneration = 0
     private var automaticRefreshPending = false
@@ -510,11 +518,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
         let trackedUnlockerWasRemoved = trackedUnlocker.map { unlocker in
             !updatedSnapshot.unlockers.contains(unlocker)
         } ?? false
+        let isExpectedEjectDisappearance = selectedWasRemoved && isRunning && activeEject.map { eject in
+            let phase = eject.phase == .launching && runner.hasLaunchedCommand(
+                executable: "/usr/sbin/diskutil",
+                arguments: ["eject", "/dev/\(eject.disk.identifier)"]
+            ) ? EjectPhase.inFlight : eject.phase
+            return eject.generation == operationGeneration && expectedEjectDisappearance(
+                identifier: identifier,
+                volume: eject.volume,
+                disk: eject.disk,
+                phase: phase
+            )
+        } == true
         if selectedWasRemoved {
             selectionRequiresUserChoice = true
             if isRunning {
-                runner.cancel()
-                appendLog("SELECTED STORAGE DISCONNECTED: stopping the operation; select the device again after it reappears.\n")
+                if isExpectedEjectDisappearance {
+                    appendLog("EJECT TRANSITION: selected storage disappeared; recording the action result and diagnostic coverage.\n")
+                } else {
+                    runner.cancel()
+                    appendLog("SELECTED STORAGE DISCONNECTED: stopping the operation; select the device again after it reappears.\n")
+                }
             }
         }
 
@@ -537,7 +561,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
         updateSelectionDetails()
         setControlsForRunningState(isRunning)
         if selectedWasRemoved {
-            setStatus("Selected storage disconnected — choose the volume again", color: .systemOrange)
+            if !isExpectedEjectDisappearance {
+                setStatus("Selected storage disconnected — choose the volume again", color: .systemOrange)
+            }
             if !isRunning {
                 appendLog("SELECTED STORAGE DISCONNECTED: /dev/\(identifier) disappeared; the selected volume was cleared.\n")
             }
@@ -1070,6 +1096,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
     }
 
     private func beginOperation(status: String) {
+        operationGeneration += 1
+        activeEject = nil
         isRunning = true
         completeLog = ""
         textView?.string = ""
@@ -1102,6 +1130,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
         refreshWorkItem = nil
         unlockRetryWorkItem?.cancel()
         unlockRetryWorkItem = nil
+        if let eject = activeEject {
+            activeEject?.phase = ejectPhaseAfterStop(eject.phase)
+        }
         runner.cancel()
         scanRunner.cancel()
         stopButton?.isEnabled = false
@@ -1130,32 +1161,191 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
         }
 
         beginOperation(status: "Ejecting external disk…")
+        let generation = operationGeneration
+        activeEject = ActiveEject(
+            generation: generation,
+            volume: volume,
+            disk: disk,
+            phase: .preflight
+        )
         let devicePath = "/dev/\(volume.wholeDiskIdentifier)"
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            guard let self else {
+            self?.performEject(volume: volume, disk: disk, devicePath: devicePath, generation: generation)
+        }
+    }
+
+    nonisolated private func performEject(
+        volume: ExternalVolume,
+        disk: ExternalDisk,
+        devicePath: String,
+        generation: Int
+    ) {
+        postOperationHeader(action: "Safe Eject Disk", volume: volume, disk: disk)
+        var mutationRequested = false
+        do {
+            _ = try validatedSelectedVolume(volume: volume, disk: disk, runner: runner)
+            guard case let .observed(expectedID) = disk.mediaIdentity else {
+                throw TroubleshooterError.selectedStorageChanged(reason: "the selected disk has no captured IOMedia identity")
+            }
+            try markEjectLaunching(generation: generation)
+            let result = try runLogged(
+                executable: "/usr/sbin/diskutil",
+                arguments: ["eject", devicePath],
+                runner: runner,
+                onLaunch: { [weak self] in
+                    mutationRequested = true
+                    self?.markEjectCommandStarted(generation: generation)
+                }
+            )
+            let presence = observeEjectedMedia(
+                diskIdentifier: disk.identifier,
+                expectedRegistryEntryID: expectedID,
+                runner: runner
+            )
+            postEjectObservation(presence, devicePath: devicePath)
+            markEjectPostconditionObserved(generation: generation)
+            appendOptionalDiskArbitrationErrors(volume: volume, runner: runner)
+            if result.exitStatus != 0 {
+                postLog(guidedFailureExplanation(exitStatus: result.exitStatus, output: result.output, volume: volume) + "\n")
+            }
+            let outcome = ejectOutcome(exitStatus: result.exitStatus, mediaPresence: presence)
+            let message: String
+            switch outcome {
+            case .success:
+                message = "Safely ejected \(devicePath); original media is absent"
+            case .failed:
+                message = "Eject command exited \(result.exitStatus); original media is still present"
+            case .unverified:
+                message = "Eject command exited \(result.exitStatus); final state of the original media is unverified"
+            }
+            postEjectCompletion(generation: generation, outcome: outcome, message: message, mutationRequested: true)
+        } catch TroubleshooterError.cancelled {
+            if mutationRequested {
+                postEjectCompletion(
+                    generation: generation,
+                    outcome: .unverified,
+                    message: "Stopped after the eject command was requested; verify the disk state",
+                    mutationRequested: true
+                )
+            } else {
+                postEjectCompletion(generation: generation, outcome: nil, message: "Operation stopped before eject", mutationRequested: false)
+            }
+        } catch {
+            postLog("FATAL: \(error.localizedDescription)\n")
+            postEjectCompletion(
+                generation: generation,
+                outcome: mutationRequested ? .unverified : .failed,
+                message: mutationRequested
+                    ? "Eject command outcome unknown: \(error.localizedDescription)"
+                    : error.localizedDescription,
+                mutationRequested: mutationRequested
+            )
+        }
+    }
+
+    nonisolated private func markEjectLaunching(generation: Int) throws {
+        let ready = DispatchQueue.main.sync { [weak self] in
+            guard let self, var eject = self.activeEject,
+                  eject.generation == generation, self.isRunning, eject.phase == .preflight else {
+                return false
+            }
+            eject.phase = .launching
+            self.activeEject = eject
+            return true
+        }
+        guard ready else {
+            throw TroubleshooterError.cancelled
+        }
+    }
+
+    nonisolated private func markEjectCommandStarted(generation: Int) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self, var eject = self.activeEject,
+                  eject.generation == generation, self.isRunning, eject.phase == .launching else {
                 return
             }
-            self.postOperationHeader(action: "Safe Eject Disk", volume: volume, disk: disk)
-            do {
-                _ = try self.validatedSelectedVolume(volume: volume, disk: disk, runner: self.runner)
-                let result = try self.runLogged(
-                    executable: "/usr/sbin/diskutil",
-                    arguments: ["eject", devicePath],
-                    runner: self.runner
-                )
-                if result.exitStatus == 0 {
-                    self.finishSuccess("Safely ejected \(devicePath)")
-                } else {
-                    self.postLog(guidedFailureExplanation(exitStatus: result.exitStatus, output: result.output, volume: volume) + "\n")
-                    self.finishFailure("Eject failed for \(devicePath)")
-                }
-            } catch TroubleshooterError.cancelled {
-                self.finishCancelled()
-            } catch {
-                self.postLog("FATAL: \(error.localizedDescription)\n")
-                self.finishFailure(error.localizedDescription)
+            eject.phase = .inFlight
+            self.activeEject = eject
+        }
+    }
+
+    nonisolated private func markEjectPostconditionObserved(generation: Int) {
+        DispatchQueue.main.sync { [weak self] in
+            guard let self, var eject = self.activeEject,
+                  eject.generation == generation, self.isRunning, eject.phase == .inFlight else {
+                return
             }
+            eject.phase = .postconditionObserved
+            self.activeEject = eject
+        }
+    }
+
+    nonisolated private func observeEjectedMedia(
+        diskIdentifier: String,
+        expectedRegistryEntryID: UInt64,
+        runner: CommandRunner
+    ) -> SelectedMediaPresence {
+        postCollectionStep("IOKit: verify original IOMedia for /dev/\(diskIdentifier) after eject")
+        do {
+            return try TransportScanner(runner: runner).selectedMediaPresence(
+                diskIdentifier: diskIdentifier,
+                expectedRegistryEntryID: expectedRegistryEntryID
+            )
+        } catch {
+            return .unavailable(error.localizedDescription)
+        }
+    }
+
+    nonisolated private func postEjectObservation(_ presence: SelectedMediaPresence, devicePath: String) {
+        switch presence {
+        case .absent:
+            postLog("POSTCONDITION OBSERVED: the original whole-disk IOMedia is absent from \(devicePath).\n")
+        case .same:
+            postLog("POSTCONDITION OBSERVED: the original whole-disk IOMedia remains active.\n")
+        case .replaced:
+            postLog("POSTCONDITION UNKNOWN: \(devicePath) now names different whole-disk media; the original device may have disappeared or been replaced.\n")
+        case let .unavailable(reason):
+            postLog("POSTCONDITION UNKNOWN: could not verify original whole-disk media: \(reason)\n")
+        }
+    }
+
+    nonisolated private func postEjectCompletion(
+        generation: Int,
+        outcome: StorageActionOutcome?,
+        message: String,
+        mutationRequested: Bool
+    ) {
+        DispatchQueue.main.async { [weak self] in
+            self?.completeEject(generation: generation, outcome: outcome, message: message, mutationRequested: mutationRequested)
+        }
+    }
+
+    private func completeEject(
+        generation: Int,
+        outcome: StorageActionOutcome?,
+        message: String,
+        mutationRequested: Bool
+    ) {
+        guard let eject = activeEject, eject.generation == generation else {
+            return
+        }
+        activeEject = nil
+        let finalOutcome = completedEjectOutcome(outcome: outcome, phase: eject.phase, commandLaunched: mutationRequested)
+        switch finalOutcome {
+        case .success:
+            appendLog("\nRESULT: SUCCESS — \(message)\n")
+            finish(message, color: .systemGreen)
+        case .failed:
+            appendLog("\nRESULT: FAILED — \(message)\n")
+            finish(message, color: .systemRed)
+        case .unverified:
+            let reason = eject.phase == .stopped ? "Stop was requested during eject; verify the original disk state" : message
+            appendLog("\nRESULT: UNVERIFIED — \(reason). Check the disk in Disk Utility before another action.\n")
+            finish("Eject outcome unverified — check Disk Utility", color: .systemOrange)
+        case nil:
+            appendLog("\nRESULT: CANCELLED — \(message)\n")
+            finish("Cancelled", color: .systemOrange)
         }
     }
 
@@ -1267,12 +1457,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
         }
 
         postOperationHeader(action: "Mount Read-Only", volume: volume, disk: disk)
+        var mutationRequested = false
         do {
             _ = try collectInspectionEvidence(volume: volume, disk: disk, runner: runner)
             let currentVolume = try validatedSelectedVolume(volume: volume, disk: disk, runner: runner)
             guard currentVolume.isLocked != true else {
                 postLog(guidedFailureExplanation(exitStatus: 1, output: "volume locked", volume: volume) + "\n")
-                try appendDiskArbitrationErrors(volume: volume, runner: runner)
+                appendOptionalDiskArbitrationErrors(volume: volume, runner: runner)
                 finishFailure("Selected volume is encrypted and locked")
                 return
             }
@@ -1284,58 +1475,64 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
                 let unmount = try runLogged(
                     executable: "/usr/sbin/diskutil",
                     arguments: ["unmount", "/dev/\(volume.identifier)"],
-                    runner: runner
+                    runner: runner,
+                    onLaunch: { mutationRequested = true }
                 )
                 guard unmount.exitStatus == 0 else {
                     postLog(guidedFailureExplanation(exitStatus: unmount.exitStatus, output: unmount.output, volume: volume) + "\n")
-                    try appendDiskArbitrationErrors(volume: volume, runner: runner)
-                    finishFailure("Could not unmount the selected volume for read-only remount")
+                    let postcondition = observeSelectedStorage(volume: volume, disk: disk, runner: runner)
+                    postStorageObservation(postcondition)
+                    let result = unmountOutcome(exitStatus: unmount.exitStatus, observation: postcondition)
+                    appendOptionalDiskArbitrationErrors(volume: volume, runner: runner)
+                    finishStorageAction(StorageActionResult(
+                        outcome: result.outcome,
+                        message: result.message + "; read-only mount was not attempted"
+                    ))
                     return
                 }
+                postLog("INTERMEDIATE RESULT: unmount command completed; read-only mount has not yet been verified.\n")
             }
 
+            let unmountedVolume = try validatedSelectedVolume(volume: volume, disk: disk, runner: runner)
+            guard nonEmpty(unmountedVolume.mountPoint) == nil else {
+                postStorageObservation(.verified(unmountedVolume))
+                finishUnverified("The selected volume was still mounted before the read-only mount request")
+                return
+            }
             let outcome = try runMountRequest(
                 volume: volume,
                 disk: disk,
                 arguments: ["mount", "readOnly", "/dev/\(volume.identifier)"],
-                runner: runner
+                runner: runner,
+                onLaunch: { mutationRequested = true }
             )
-            try appendDiskArbitrationErrors(volume: volume, runner: runner)
-
-            guard outcome.mountResult.exitStatus == 0 else {
+            postStorageObservation(outcome.postcondition)
+            if outcome.mountResult.exitStatus != 0 {
                 postLog(guidedFailureExplanation(exitStatus: outcome.mountResult.exitStatus, output: outcome.mountResult.output, volume: volume) + "\n")
-                finishFailure("Read-only mount failed for /dev/\(volume.identifier)")
-                return
             }
-            guard outcome.verificationResult.exitStatus == 0, let currentInfo = outcome.currentInfo else {
-                postLog(guidedFailureExplanation(exitStatus: outcome.verificationResult.exitStatus, output: outcome.verificationResult.output, volume: volume) + "\n")
-                finishFailure("Could not verify /dev/\(volume.identifier) after the mount request")
-                return
-            }
-            guard let mountPoint = nonEmpty(currentInfo.mountPoint) else {
-                postLog(guidedFailureExplanation(exitStatus: 0, output: outcome.mountResult.output, volume: volume) + "\n")
-                finishFailure("Mount command succeeded, but no mount point was verified")
-                return
-            }
-            guard currentInfo.writableVolume == false else {
-                let reason = currentInfo.writableVolume == true
-                    ? "macOS reports a writable volume despite the read-only request"
-                    : "macOS did not report the volume's writable state"
-                postLog("READ-ONLY VERIFICATION FAILED: \(reason). Check this volume in Disk Utility before using it.\n")
-                finishFailure("Read-only state was not verified at \(mountPoint)")
-                return
-            }
-
-            postLog("VERIFIED MOUNT: \(mountPoint) (read-only)\n")
-            finishSuccess("Mounted \(volume.name) at \(mountPoint)")
+            let result = readOnlyMountOutcome(exitStatus: outcome.mountResult.exitStatus, observation: outcome.postcondition)
+            appendOptionalDiskArbitrationErrors(volume: volume, runner: runner)
+            finishStorageAction(result)
         } catch TroubleshooterError.cancelled {
-            finishCancelled()
+            if mutationRequested {
+                finishUnverified("Stopped after a storage command launched; verify the current volume state")
+            } else {
+                finishCancelled()
+            }
         } catch let error as TroubleshooterError {
             postLog("\nFATAL: \(error.localizedDescription)\n")
-            finishFailure(error.localizedDescription)
+            if mutationRequested {
+                finishUnverified("Storage command outcome unknown: \(error.localizedDescription)")
+            } else {
+                finishFailure(error.localizedDescription)
+            }
         } catch {
             postLog("\nFATAL: Unexpected execution error: \(error.localizedDescription)\n")
-            finishFailure("Unexpected execution error: \(error.localizedDescription)")
+            if mutationRequested {
+                finishUnverified("Storage command outcome unknown: \(error.localizedDescription)")
+            } else {
+                finishFailure("Unexpected execution error: \(error.localizedDescription)")
+            }
         }
     }
 
@@ -1350,12 +1547,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
         }
 
         postOperationHeader(action: "Mount Normally", volume: volume, disk: disk)
+        var mutationRequested = false
         do {
             _ = try collectInspectionEvidence(volume: volume, disk: disk, runner: runner)
             let currentVolume = try validatedSelectedVolume(volume: volume, disk: disk, runner: runner)
             guard currentVolume.isLocked != true else {
                 postLog(guidedFailureExplanation(exitStatus: 1, output: "volume locked", volume: volume) + "\n")
-                try appendDiskArbitrationErrors(volume: volume, runner: runner)
+                appendOptionalDiskArbitrationErrors(volume: volume, runner: runner)
                 finishFailure("Selected volume is encrypted and locked")
                 return
             }
@@ -1364,35 +1562,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
                 volume: volume,
                 disk: disk,
                 arguments: ["mount", "/dev/\(volume.identifier)"],
-                runner: runner
+                runner: runner,
+                onLaunch: { mutationRequested = true }
             )
-            try appendDiskArbitrationErrors(volume: volume, runner: runner)
-            guard outcome.mountResult.exitStatus == 0 else {
+            postStorageObservation(outcome.postcondition)
+            if outcome.mountResult.exitStatus != 0 {
                 postLog(guidedFailureExplanation(exitStatus: outcome.mountResult.exitStatus, output: outcome.mountResult.output, volume: volume) + "\n")
-                finishFailure("Normal mount failed for /dev/\(volume.identifier)")
-                return
             }
-            guard outcome.verificationResult.exitStatus == 0, let currentInfo = outcome.currentInfo else {
-                postLog(guidedFailureExplanation(exitStatus: outcome.verificationResult.exitStatus, output: outcome.verificationResult.output, volume: volume) + "\n")
-                finishFailure("Could not verify /dev/\(volume.identifier) after the mount request")
-                return
-            }
-            guard let mountPoint = nonEmpty(currentInfo.mountPoint) else {
-                postLog(guidedFailureExplanation(exitStatus: 0, output: outcome.mountResult.output, volume: volume) + "\n")
-                finishFailure("Mount command succeeded, but no mount point was verified")
-                return
-            }
-
-            postLog("VERIFIED MOUNT: \(mountPoint) (normal)\n")
-            finishSuccess("Mounted \(volume.name) at \(mountPoint)")
+            let result = normalMountOutcome(exitStatus: outcome.mountResult.exitStatus, observation: outcome.postcondition)
+            appendOptionalDiskArbitrationErrors(volume: volume, runner: runner)
+            finishStorageAction(result)
         } catch TroubleshooterError.cancelled {
-            finishCancelled()
+            if mutationRequested {
+                finishUnverified("Stopped after a mount command launched; verify the current volume state")
+            } else {
+                finishCancelled()
+            }
         } catch let error as TroubleshooterError {
             postLog("\nFATAL: \(error.localizedDescription)\n")
-            finishFailure(error.localizedDescription)
+            if mutationRequested {
+                finishUnverified("Mount command outcome unknown: \(error.localizedDescription)")
+            } else {
+                finishFailure(error.localizedDescription)
+            }
         } catch {
             postLog("\nFATAL: Unexpected execution error: \(error.localizedDescription)\n")
-            finishFailure("Unexpected execution error: \(error.localizedDescription)")
+            if mutationRequested {
+                finishUnverified("Mount command outcome unknown: \(error.localizedDescription)")
+            } else {
+                finishFailure("Unexpected execution error: \(error.localizedDescription)")
+            }
         }
     }
 
@@ -1407,28 +1606,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
         }
 
         postOperationHeader(action: "Unmount Volume", volume: volume, disk: disk)
+        var mutationRequested = false
         do {
             _ = try validatedSelectedVolume(volume: volume, disk: disk, runner: runner)
-            let result = try runLogged(
+            let commandResult = try runLogged(
                 executable: "/usr/sbin/diskutil",
                 arguments: ["unmount", "/dev/\(volume.identifier)"],
-                runner: runner
+                runner: runner,
+                onLaunch: { mutationRequested = true }
             )
-            try appendDiskArbitrationErrors(volume: volume, runner: runner)
-            guard result.exitStatus == 0 else {
-                postLog(guidedFailureExplanation(exitStatus: result.exitStatus, output: result.output, volume: volume) + "\n")
-                finishFailure("Unmount failed for /dev/\(volume.identifier)")
-                return
+            let postcondition = observeSelectedStorage(volume: volume, disk: disk, runner: runner)
+            postStorageObservation(postcondition)
+            if commandResult.exitStatus != 0 {
+                postLog(guidedFailureExplanation(exitStatus: commandResult.exitStatus, output: commandResult.output, volume: volume) + "\n")
             }
-            finishSuccess("Unmounted /dev/\(volume.identifier)")
+            let result = unmountOutcome(exitStatus: commandResult.exitStatus, observation: postcondition)
+            appendOptionalDiskArbitrationErrors(volume: volume, runner: runner)
+            finishStorageAction(result)
         } catch TroubleshooterError.cancelled {
-            finishCancelled()
+            if mutationRequested {
+                finishUnverified("Stopped after an unmount command launched; verify the current volume state")
+            } else {
+                finishCancelled()
+            }
         } catch let error as TroubleshooterError {
             postLog("\nFATAL: \(error.localizedDescription)\n")
-            finishFailure(error.localizedDescription)
+            if mutationRequested {
+                finishUnverified("Unmount command outcome unknown: \(error.localizedDescription)")
+            } else {
+                finishFailure(error.localizedDescription)
+            }
         } catch {
             postLog("\nFATAL: Unexpected execution error: \(error.localizedDescription)\n")
-            finishFailure("Unexpected execution error: \(error.localizedDescription)")
+            if mutationRequested {
+                finishUnverified("Unmount command outcome unknown: \(error.localizedDescription)")
+            } else {
+                finishFailure("Unexpected execution error: \(error.localizedDescription)")
+            }
         }
     }
 
@@ -1502,44 +1716,54 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
         volume: ExternalVolume,
         disk: ExternalDisk,
         arguments: [String],
-        runner: CommandRunner
+        runner: CommandRunner,
+        onLaunch: () -> Void
     ) throws -> MountRequestOutcome {
-        _ = try validatedSelectedVolume(volume: volume, disk: disk, runner: runner)
         let mountResult = try runLogged(
             executable: "/usr/sbin/diskutil",
             arguments: arguments,
-            runner: runner
+            runner: runner,
+            onLaunch: onLaunch
         )
-        let verifyArguments = ["info", "-plist", "/dev/\(volume.identifier)"]
-        let verificationResult = try runCaptured(
-            executable: "/usr/sbin/diskutil",
-            arguments: verifyArguments,
-            reason: "structured output captured for mount verification",
-            runner: runner
-        )
-        let currentInfo = verificationResult.exitStatus == 0
-            ? try decodePropertyList(
-                DiskInfoPropertyList.self,
-                output: verificationResult.output,
-                command: renderedCommand(executable: "/usr/sbin/diskutil", arguments: verifyArguments)
-            )
-            : nil
-        if let currentInfo, currentInfo.identifier != volume.identifier {
-            throw TroubleshooterError.selectedStorageChanged(reason: "mount verification returned a different volume")
-        }
-        let verifiedVolume = try validatedSelectedVolume(volume: volume, disk: disk, runner: runner)
-        if let currentInfo {
-            guard verifiedVolume.mountPoint == nonEmpty(currentInfo.mountPoint),
-                verifiedVolume.isWritable == currentInfo.writableVolume
-            else {
-                throw TroubleshooterError.selectedStorageChanged(reason: "the mount or writable state changed during mount verification")
-            }
-        }
         return MountRequestOutcome(
             mountResult: mountResult,
-            verificationResult: verificationResult,
-            currentInfo: currentInfo
+            postcondition: observeSelectedStorage(volume: volume, disk: disk, runner: runner)
         )
+    }
+
+    nonisolated private func observeSelectedStorage(
+        volume: ExternalVolume,
+        disk: ExternalDisk,
+        runner: CommandRunner
+    ) -> StorageStateObservation {
+        do {
+            return .verified(try validatedSelectedVolume(volume: volume, disk: disk, runner: runner))
+        } catch {
+            return .unavailable(error.localizedDescription)
+        }
+    }
+
+    nonisolated private func appendOptionalDiskArbitrationErrors(volume: ExternalVolume, runner: CommandRunner) {
+        let coverage = collectDiagnosticCoverage {
+            try appendDiskArbitrationErrors(volume: volume, runner: runner)
+        }
+        if case let .unavailable(reason) = coverage {
+            postLog("DIAGNOSTIC COVERAGE UNAVAILABLE: \(reason)\n")
+        }
+    }
+
+    nonisolated private func postStorageObservation(_ observation: StorageStateObservation) {
+        switch observation {
+        case let .verified(current):
+            if let mountPoint = nonEmpty(current.mountPoint) {
+                let writable = current.isWritable.map { $0 ? "writable" : "read-only" } ?? "writable state unknown"
+                postLog("POSTCONDITION OBSERVED: /dev/\(current.identifier) is mounted at \(mountPoint) (\(writable)); selected media identity verified.\n")
+            } else {
+                postLog("POSTCONDITION OBSERVED: /dev/\(current.identifier) is unmounted; selected media identity verified.\n")
+            }
+        case let .unavailable(reason):
+            postLog("POSTCONDITION UNKNOWN: \(reason)\n")
+        }
     }
 
     nonisolated private func appendDiskArbitrationErrors(volume: ExternalVolume, runner: CommandRunner) throws {
@@ -1582,15 +1806,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
         arguments: [String],
         runner: CommandRunner
     ) throws -> CommandResult {
+        try runLogged(executable: executable, arguments: arguments, runner: runner, onLaunch: {})
+    }
+
+    nonisolated private func runLogged(
+        executable: String,
+        arguments: [String],
+        runner: CommandRunner,
+        onLaunch: () -> Void
+    ) throws -> CommandResult {
         let command = renderedCommand(executable: executable, arguments: arguments)
         postLog("$ \(command)\n")
         let result = try runner.run(
             executable: executable,
             arguments: arguments,
-            timeoutSeconds: 30
-        ) { [weak self] chunk in
-            self?.postLog(chunk)
-        }
+            timeoutSeconds: 30,
+            onLaunch: onLaunch,
+            onOutput: { [weak self] chunk in
+                self?.postLog(chunk)
+            }
+        )
         if !result.output.hasSuffix("\n") {
             postLog("\n")
         }
@@ -1627,6 +1862,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
         }
     }
 
+    nonisolated private func finishStorageAction(_ result: StorageActionResult) {
+        switch result.outcome {
+        case .success:
+            finishSuccess(result.message)
+        case .failed:
+            finishFailure(result.message)
+        case .unverified:
+            finishUnverified(result.message)
+        }
+    }
+
     nonisolated private func finishSuccess(_ message: String) {
         DispatchQueue.main.async { [weak self] in
             self?.appendLog("\nRESULT: SUCCESS — \(message)\n")
@@ -1638,6 +1884,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
         DispatchQueue.main.async { [weak self] in
             self?.appendLog("\nRESULT: FAILED — \(message)\n")
             self?.finish(message, color: .systemRed)
+        }
+    }
+
+    nonisolated private func finishUnverified(_ message: String) {
+        DispatchQueue.main.async { [weak self] in
+            self?.appendLog("\nRESULT: UNVERIFIED — \(message). Check the selected device in Disk Utility before another action.\n")
+            self?.finish("Outcome unverified — check Disk Utility", color: .systemOrange)
         }
     }
 

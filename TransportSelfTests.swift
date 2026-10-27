@@ -46,6 +46,35 @@ func runTransportSelfTests() -> Bool {
     else {
         return false
     }
+    guard
+        ejectOutcome(exitStatus: 0, mediaPresence: .absent) == .success,
+        ejectOutcome(exitStatus: 0, mediaPresence: .same) == .unverified,
+        ejectOutcome(exitStatus: 0, mediaPresence: .replaced) == .unverified,
+        ejectOutcome(exitStatus: 0, mediaPresence: .unavailable("lookup failed")) == .unverified,
+        ejectOutcome(exitStatus: 1, mediaPresence: .same) == .failed,
+        ejectOutcome(exitStatus: 1, mediaPresence: .absent) == .unverified,
+        ejectOutcome(exitStatus: 1, mediaPresence: .replaced) == .unverified,
+        ["disk4", "disk4s2", "disk8", "disk8s1"].allSatisfy({
+            expectedEjectDisappearance(identifier: $0, volume: apfsVolume, disk: disk, phase: .inFlight)
+        }),
+        ["disk40", "disk5", "disk8s2"].allSatisfy({
+            !expectedEjectDisappearance(identifier: $0, volume: apfsVolume, disk: disk, phase: .inFlight)
+        }),
+        !expectedEjectDisappearance(identifier: "disk4", volume: apfsVolume, disk: disk, phase: .preflight),
+        !expectedEjectDisappearance(identifier: "disk4", volume: apfsVolume, disk: disk, phase: .launching),
+        !expectedEjectDisappearance(identifier: "disk8s1", volume: apfsVolume, disk: disk, phase: .stopped),
+        expectedEjectDisappearance(identifier: "disk4", volume: apfsVolume, disk: disk, phase: .postconditionObserved),
+        !expectedEjectDisappearance(identifier: "disk40", volume: apfsVolume, disk: disk, phase: .postconditionObserved),
+        ejectPhaseAfterStop(.postconditionObserved) == .postconditionObserved,
+        completedEjectOutcome(outcome: .success, phase: .postconditionObserved, commandLaunched: true) == .success,
+        completedEjectOutcome(outcome: .failed, phase: .postconditionObserved, commandLaunched: true) == .failed,
+        completedEjectOutcome(outcome: .unverified, phase: .postconditionObserved, commandLaunched: true) == .unverified,
+        completedEjectOutcome(outcome: .success, phase: .stopped, commandLaunched: true) == .unverified,
+        completedEjectOutcome(outcome: nil, phase: .stopped, commandLaunched: false) == nil,
+        [EjectPhase.preflight, .launching, .inFlight, .stopped].allSatisfy({ ejectPhaseAfterStop($0) == .stopped })
+    else {
+        return false
+    }
     for stores in [["disk40s2"], ["disk4s2", "disk6s2"], [], ["disk4s2", "disk4s2"]] {
         guard case .unavailable = selectedPhysicalTransport(volume: transportTestVolume(identifier: "disk8s1", stores: stores), disk: disk) else {
             return false
@@ -108,5 +137,63 @@ private func transportTestVolume(identifier: String, stores: [String]) -> Extern
         identifier: identifier, wholeDiskIdentifier: "disk4", physicalStoreIdentifiers: stores,
         name: "Synthetic APFS volume", filesystem: "APFS", mountPoint: nil,
         isEncrypted: false, isLocked: false, isWritable: false, role: nil, size: 1000
+    )
+}
+
+/// Checks controlled postconditions and empty native registry matches without changing storage state.
+func runStorageActionOutcomeSelfTests() -> Bool {
+    let unmounted = storageActionTestVolume(mountPoint: nil, writable: false)
+    let readOnly = storageActionTestVolume(mountPoint: "/Volumes/Controlled", writable: false)
+    let writable = storageActionTestVolume(mountPoint: "/Volumes/Controlled", writable: true)
+    let unknownAccess = storageActionTestVolume(mountPoint: "/Volumes/Controlled", writable: nil)
+    let unavailable: StorageStateObservation = .unavailable("selected media identity changed")
+    let cases: [(StorageActionResult, StorageActionOutcome)] = [
+        (normalMountOutcome(exitStatus: 0, observation: .verified(writable)), .success),
+        (normalMountOutcome(exitStatus: 0, observation: .verified(readOnly)), .success),
+        (normalMountOutcome(exitStatus: 0, observation: .verified(unknownAccess)), .success),
+        (normalMountOutcome(exitStatus: 0, observation: .verified(unmounted)), .unverified),
+        (normalMountOutcome(exitStatus: 0, observation: unavailable), .unverified),
+        (normalMountOutcome(exitStatus: 7, observation: .verified(unmounted)), .failed),
+        (normalMountOutcome(exitStatus: 7, observation: .verified(writable)), .unverified),
+        (normalMountOutcome(exitStatus: 7, observation: unavailable), .unverified),
+        (readOnlyMountOutcome(exitStatus: 0, observation: .verified(readOnly)), .success),
+        (readOnlyMountOutcome(exitStatus: 0, observation: .verified(writable)), .unverified),
+        (readOnlyMountOutcome(exitStatus: 0, observation: .verified(unknownAccess)), .unverified),
+        (readOnlyMountOutcome(exitStatus: 0, observation: .verified(unmounted)), .unverified),
+        (readOnlyMountOutcome(exitStatus: 0, observation: unavailable), .unverified),
+        (readOnlyMountOutcome(exitStatus: 7, observation: .verified(unmounted)), .failed),
+        (readOnlyMountOutcome(exitStatus: 7, observation: .verified(writable)), .failed),
+        (readOnlyMountOutcome(exitStatus: 7, observation: .verified(readOnly)), .unverified),
+        (readOnlyMountOutcome(exitStatus: 7, observation: unavailable), .unverified),
+        (unmountOutcome(exitStatus: 0, observation: .verified(unmounted)), .success),
+        (unmountOutcome(exitStatus: 0, observation: .verified(writable)), .unverified),
+        (unmountOutcome(exitStatus: 0, observation: unavailable), .unverified),
+        (unmountOutcome(exitStatus: 7, observation: .verified(writable)), .failed),
+        (unmountOutcome(exitStatus: 7, observation: .verified(unmounted)), .unverified),
+        (unmountOutcome(exitStatus: 7, observation: unavailable), .unverified)
+    ]
+    guard cases.allSatisfy({ result, expected in
+        result.outcome == expected
+    }) else {
+        return false
+    }
+    do {
+        let presence = try TransportScanner(runner: CommandRunner()).selectedMediaPresence(
+            diskIdentifier: "disk99999",
+            expectedRegistryEntryID: UInt64.max
+        )
+        // An unrelated disk using the synthetic name cannot represent the unknown original identity.
+        return presence == .absent || presence == .replaced
+    } catch {
+        FileHandle.standardError.write(Data("Read-only media-absence check failed: \(error.localizedDescription)\n".utf8))
+        return false
+    }
+}
+
+private func storageActionTestVolume(mountPoint: String?, writable: Bool?) -> ExternalVolume {
+    ExternalVolume(
+        identifier: "disk8s1", wholeDiskIdentifier: "disk4", physicalStoreIdentifiers: ["disk4s2"],
+        name: "Controlled software observation", filesystem: "APFS", mountPoint: mountPoint,
+        isEncrypted: false, isLocked: false, isWritable: writable, role: nil, size: 1000
     )
 }

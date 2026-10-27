@@ -2,6 +2,21 @@ import DiskArbitration
 import Darwin
 import Foundation
 
+enum DiagnosticCoverage: Equatable, Sendable {
+    case collected
+    case unavailable(reason: String)
+}
+
+/// Retains an optional collector's failure without replacing the storage action's separate result.
+func collectDiagnosticCoverage(_ collect: () throws -> Void) -> DiagnosticCoverage {
+    do {
+        try collect()
+        return .collected
+    } catch {
+        return .unavailable(reason: error.localizedDescription)
+    }
+}
+
 private final class CommandOutputBuffer: @unchecked Sendable {
     private let lock = NSLock()
     private var output = ""
@@ -46,15 +61,22 @@ private final class CommandOutputBuffer: @unchecked Sendable {
     }
 }
 
+private struct CommandLaunchReceipt {
+    let executable: String
+    let arguments: [String]
+}
+
 final class CommandRunner: @unchecked Sendable {
     private let lock = NSLock()
     private var currentProcess: Process?
     private var commandInProgress = false
     private var cancellationRequested = false
+    private var launchReceipt: CommandLaunchReceipt?
 
     func reset() {
         lock.lock()
         cancellationRequested = false
+        launchReceipt = nil
         lock.unlock()
     }
 
@@ -75,10 +97,36 @@ final class CommandRunner: @unchecked Sendable {
         return result
     }
 
+    /// Remains available after helper exit until the next operation resets the runner.
+    func hasLaunchedCommand(executable: String, arguments: [String]) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let launchReceipt else {
+            return false
+        }
+        return launchReceipt.executable == executable && launchReceipt.arguments == arguments
+    }
+
     func run(
         executable: String,
         arguments: [String],
         timeoutSeconds: TimeInterval,
+        onOutput: @escaping (String) -> Void
+    ) throws -> CommandResult {
+        try run(
+            executable: executable,
+            arguments: arguments,
+            timeoutSeconds: timeoutSeconds,
+            onLaunch: {},
+            onOutput: onOutput
+        )
+    }
+
+    func run(
+        executable: String,
+        arguments: [String],
+        timeoutSeconds: TimeInterval,
+        onLaunch: () -> Void,
         onOutput: @escaping (String) -> Void
     ) throws -> CommandResult {
         let process = Process()
@@ -145,6 +193,7 @@ final class CommandRunner: @unchecked Sendable {
             try process.run()
             currentProcess = process
             commandInProgress = true
+            launchReceipt = CommandLaunchReceipt(executable: executable, arguments: arguments)
             lock.unlock()
         } catch {
             lock.unlock()
@@ -154,6 +203,7 @@ final class CommandRunner: @unchecked Sendable {
                 reason: error.localizedDescription
             )
         }
+        onLaunch()
 
         let outputBuffer = CommandOutputBuffer()
         var failure = collectCommandOutput(
@@ -328,6 +378,65 @@ func runCommandRunnerSelfTests() -> Bool {
             try fileManager.removeItem(at: directory)
             return false
         }
+        var launchCount = 0
+        var activeCommandWasPublished = false
+        let launched = try runner.run(
+            executable: "/usr/bin/true",
+            arguments: [],
+            timeoutSeconds: 5,
+            onLaunch: {
+                launchCount += 1
+                activeCommandWasPublished = runner.hasLaunchedCommand(executable: "/usr/bin/true", arguments: [])
+            },
+            onOutput: { _ in }
+        )
+        guard launched.exitStatus == 0, launchCount == 1, activeCommandWasPublished,
+              runner.hasLaunchedCommand(executable: "/usr/bin/true", arguments: []),
+              !runner.hasLaunchedCommand(executable: "/usr/bin/true", arguments: ["different command"]) else {
+            try fileManager.removeItem(at: directory)
+            return false
+        }
+        runner.reset()
+        guard !runner.hasLaunchedCommand(executable: "/usr/bin/true", arguments: []) else {
+            throw TroubleshooterError.invalidCommandOutput(command: "launch receipt reset self-test", reason: "A new operation retained the previous operation's launch receipt")
+        }
+        let preCancelledRunner = CommandRunner()
+        preCancelledRunner.cancel()
+        var cancelledLaunchCount = 0
+        do {
+            _ = try preCancelledRunner.run(
+                executable: "/usr/bin/true",
+                arguments: [],
+                timeoutSeconds: 5,
+                onLaunch: { cancelledLaunchCount += 1 },
+                onOutput: { _ in }
+            )
+            try fileManager.removeItem(at: directory)
+            return false
+        } catch TroubleshooterError.cancelled {
+            guard cancelledLaunchCount == 0,
+                  !preCancelledRunner.hasLaunchedCommand(executable: "/usr/bin/true", arguments: []) else {
+                try fileManager.removeItem(at: directory)
+                return false
+            }
+        }
+        var missingLaunchCount = 0
+        do {
+            _ = try runner.run(
+                executable: directory.appendingPathComponent("missing-command").path,
+                arguments: [],
+                timeoutSeconds: 5,
+                onLaunch: { missingLaunchCount += 1 },
+                onOutput: { _ in }
+            )
+            throw TroubleshooterError.invalidCommandOutput(command: "failed launch self-test", reason: "A nonexistent executable unexpectedly launched")
+        } catch TroubleshooterError.commandLaunchFailed {
+            guard missingLaunchCount == 0,
+                  !runner.hasLaunchedCommand(executable: directory.appendingPathComponent("missing-command").path, arguments: []) else {
+                throw TroubleshooterError.invalidCommandOutput(command: "failed launch self-test", reason: "Launch notification ran for a command that never started")
+            }
+        }
+        try verifyStorageActionDiagnosticSeparation()
         do {
             _ = try runner.run(
                 executable: "/bin/sh",
@@ -515,6 +624,82 @@ func runCommandRunnerSelfTests() -> Bool {
             }
         }
         return false
+    }
+}
+
+/// Uses real harmless helpers and controlled volume observations; it does not validate physical storage actions.
+private func verifyStorageActionDiagnosticSeparation() throws {
+    let actionRunner = CommandRunner()
+    var actionLaunches = 0
+    let action = try actionRunner.run(
+        executable: "/usr/bin/true",
+        arguments: [],
+        timeoutSeconds: 5,
+        onLaunch: { actionLaunches += 1 },
+        onOutput: { _ in }
+    )
+    let unmounted = ExternalVolume(
+        identifier: "disk8s1", wholeDiskIdentifier: "disk4", physicalStoreIdentifiers: ["disk4s2"],
+        name: "Controlled software observation", filesystem: "APFS", mountPoint: nil,
+        isEncrypted: false, isLocked: false, isWritable: false, role: nil, size: 1000
+    )
+    let verifiedAction = unmountOutcome(exitStatus: action.exitStatus, observation: .verified(unmounted))
+    let diagnosticArguments = ["-c", "printf 'diagnostic fixture failure\\n'; exit 7"]
+    let failedCoverage = collectDiagnosticCoverage {
+        let diagnostic = try actionRunner.run(
+            executable: "/bin/sh", arguments: diagnosticArguments, timeoutSeconds: 5
+        ) { _ in }
+        guard diagnostic.exitStatus == 0 else {
+            throw TroubleshooterError.commandFailed(
+                command: renderedCommand(executable: "/bin/sh", arguments: diagnosticArguments),
+                exitStatus: diagnostic.exitStatus, output: diagnostic.output
+            )
+        }
+    }
+    guard case let .unavailable(reason) = failedCoverage,
+          reason.contains("diagnostic fixture failure"),
+          verifiedAction.outcome == .success,
+          action.exitStatus == 0, actionLaunches == 1 else {
+        throw TroubleshooterError.invalidCommandOutput(command: "optional diagnostic failure self-test", reason: "A diagnostic failure obscured the verified action or lost its cause")
+    }
+
+    let failedAction = try actionRunner.run(
+        executable: "/bin/sh", arguments: ["-c", "printf 'action fixture failure\\n'; exit 9"],
+        timeoutSeconds: 5, onLaunch: { actionLaunches += 1 }, onOutput: { _ in }
+    )
+    let failedActionOutcome = normalMountOutcome(exitStatus: failedAction.exitStatus, observation: .verified(unmounted))
+    let cancelledDiagnosticRunner = CommandRunner()
+    var diagnosticLaunches = 0
+    var ejectPhase = EjectPhase.postconditionObserved
+    let cancelledCoverage = collectDiagnosticCoverage {
+        _ = try cancelledDiagnosticRunner.run(
+            executable: "/bin/sleep", arguments: ["30"], timeoutSeconds: 5,
+            onLaunch: {
+                diagnosticLaunches += 1
+                ejectPhase = ejectPhaseAfterStop(ejectPhase)
+                cancelledDiagnosticRunner.cancel()
+            },
+            onOutput: { _ in }
+        )
+    }
+    guard cancelledCoverage == .unavailable(reason: TroubleshooterError.cancelled.localizedDescription),
+          diagnosticLaunches == 1, cancelledDiagnosticRunner.isCancelled(),
+          verifiedAction.outcome == .success,
+          failedActionOutcome.outcome == .failed,
+          failedAction.exitStatus == 9, failedAction.output == "action fixture failure\n",
+          actionLaunches == 2,
+          ejectPhaseAfterStop(.postconditionObserved) == .postconditionObserved,
+          ejectPhaseAfterStop(.inFlight) == .stopped,
+          completedEjectOutcome(outcome: ejectOutcome(exitStatus: action.exitStatus, mediaPresence: .absent), phase: ejectPhase, commandLaunched: true) == .success,
+          completedEjectOutcome(outcome: ejectOutcome(exitStatus: failedAction.exitStatus, mediaPresence: .same), phase: ejectPhase, commandLaunched: true) == .failed,
+          completedEjectOutcome(outcome: .success, phase: ejectPhaseAfterStop(.inFlight), commandLaunched: true) == .unverified else {
+        throw TroubleshooterError.invalidCommandOutput(command: "optional diagnostic cancellation self-test", reason: "Stopping a launched diagnostic changed a known action outcome or repeated the action")
+    }
+    let collectedCoverage = collectDiagnosticCoverage {
+        _ = try actionRunner.run(executable: "/usr/bin/true", arguments: [], timeoutSeconds: 5) { _ in }
+    }
+    guard collectedCoverage == .collected else {
+        throw TroubleshooterError.invalidCommandOutput(command: "diagnostic recovery self-test", reason: "A later harmless diagnostic did not complete")
     }
 }
 

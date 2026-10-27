@@ -107,7 +107,7 @@ Volume Mount Troubleshooter currently provides:
 - native Disk Arbitration notification handling for attached and disconnected devices, including immediate stale-selector removal;
 - exact post-mount verification of mount point and writable state;
 - guided explanations for common mount and eject failures;
-- confirmed whole-disk Safe Eject;
+- whole-disk Safe Eject with a separate original-media postcondition check;
 - privacy-redacted clipboard and saved reports; and
 - a terminal-style live console with Stop, Copy Report, Save Report, and Show Volumes controls.
 
@@ -140,7 +140,7 @@ The app separates inspection, mounting, and whole-device ejection.
 | Safe Eject Disk | Selected volume's whole physical disk | Ejects the disk and sibling volumes | Additional warning dialog |
 | Save Report | User-selected destination | Writes one text report | Standard save dialog |
 
-The application never constructs or runs repair, erase, partition, format, force-eject, unlock, or `sudo` commands. A failed mount remains a failure with its original output visible; the app does not silently switch to a different mode.
+The application never constructs or runs repair, erase, partition, format, force-eject, unlock, or `sudo` commands. A nonzero mount exit and its original output remain visible; the app does not silently switch to a different mode.
 
 ---
 
@@ -304,6 +304,8 @@ The app registers native Disk Arbitration appeared and disappeared callbacks. Wh
 
 If a disk disappears while an inventory is already running, the app cancels and invalidates that inventory so its older result cannot restore the removed selector entry. It then performs one follow-up refresh. Storage inventory commands time out after 15 seconds so a vendor unlock transition cannot leave the selector waiting indefinitely.
 
+During an explicit Safe Eject, disappearance of the selected disk or volume is treated as an expected transition after the helper launches. The selector still clears immediately; the final result waits for the command exit and a fresh check of the original whole-disk media identity. Stop before launch cancels the request. Stop after launch leaves the outcome unverified until its postcondition has been recorded; stopping only the later optional log collection preserves the recorded action result and reports incomplete diagnostic coverage separately.
+
 When a virtual unlocker is present without its matching data disk, the app retries discovery five times at two-second intervals. The visible progression advances from **Unlocker detected** through **Waiting for data disk** to the discovered volume name, such as **Extreme SSD ready**. Association uses the shared macOS device-tree path rather than vendor names or transient `diskN` identifiers.
 
 Automatic detection refreshes the selector. It never automatically mounts, unmounts, unlocks, repairs, or ejects a device.
@@ -335,7 +337,7 @@ If the selected volume is already mounted writable, macOS cannot convert that li
 /usr/sbin/diskutil mount readOnly /dev/diskNsN
 ```
 
-After either mode, the app decodes fresh `diskutil info -plist` output. Success requires a non-empty mount point. Read-only success additionally requires macOS to report that the mounted volume is not writable.
+After either mode, the app decodes fresh `diskutil info -plist` output and verifies that it still belongs to the selected media. Success requires a non-empty mount point. Read-only success additionally requires macOS to report that the mounted volume is not writable. Unmount success requires the same selected volume to have no mount point. If the final state cannot be verified, the result says **Unverified** and asks the user to check Disk Utility. A failure to collect recent Disk Arbitration logs is reported separately from the storage action. A request is marked as launched only after its helper starts, so a launch failure or prelaunch cancellation does not imply that storage changed.
 
 **Unmount Volume** is enabled only while the selected volume is mounted and targets that volume alone:
 
@@ -434,6 +436,8 @@ An empty result means no matching retained error or fault entry was returned for
 ```
 
 The app warns that sibling volumes on the same physical disk are included. It does not use `force`, and it preserves `Resource busy` or other failures rather than masking them.
+
+Success requires both a zero command exit and absence of the original whole-disk IOMedia service. A USB bridge can remain connected after ejection. If the original media is still present, its BSD number is reused by different media, or the check fails, the app reports the outcome as unverified and asks for a Disk Utility check. A nonzero command exit with the original media still present is reported as a command failure.
 
 Safe Eject should be used only after closing files and applications that are using every volume on that disk.
 
