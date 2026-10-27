@@ -304,7 +304,7 @@ The app registers native Disk Arbitration appeared and disappeared callbacks. Wh
 
 If a disk disappears while an inventory is already running, the app cancels and invalidates that inventory so its older result cannot restore the removed selector entry. It then performs one follow-up refresh. Storage inventory commands time out after 15 seconds so a vendor unlock transition cannot leave the selector waiting indefinitely.
 
-During an explicit Safe Eject, disappearance of the selected disk or volume is treated as an expected transition while the command is in flight. The selector still clears immediately; the final result waits for the command exit and a fresh check of the original whole-disk media identity. Stop leaves the eject outcome unverified if the command may have started.
+During an explicit Safe Eject, disappearance of the selected disk or volume is treated as an expected transition after the helper launches. The selector still clears immediately; the final result waits for the command exit and a fresh check of the original whole-disk media identity. Stop before launch cancels the request. Stop after launch leaves the outcome unverified until its postcondition has been recorded; stopping only the later optional log collection preserves the recorded action result and reports incomplete diagnostic coverage separately.
 
 When a virtual unlocker is present without its matching data disk, the app retries discovery five times at two-second intervals. The visible progression advances from **Unlocker detected** through **Waiting for data disk** to the discovered volume name, such as **Extreme SSD ready**. Association uses the shared macOS device-tree path rather than vendor names or transient `diskN` identifiers.
 
@@ -337,7 +337,7 @@ If the selected volume is already mounted writable, macOS cannot convert that li
 /usr/sbin/diskutil mount readOnly /dev/diskNsN
 ```
 
-After either mode, the app decodes fresh `diskutil info -plist` output and verifies that it still belongs to the selected media. Success requires a non-empty mount point. Read-only success additionally requires macOS to report that the mounted volume is not writable. Unmount success requires the same selected volume to have no mount point. If the final state cannot be verified, the result says **Unverified** and asks the user to check Disk Utility. A failure to collect recent Disk Arbitration logs is reported separately from the storage action.
+After either mode, the app decodes fresh `diskutil info -plist` output and verifies that it still belongs to the selected media. Success requires a non-empty mount point. Read-only success additionally requires macOS to report that the mounted volume is not writable. Unmount success requires the same selected volume to have no mount point. If the final state cannot be verified, the result says **Unverified** and asks the user to check Disk Utility. A failure to collect recent Disk Arbitration logs is reported separately from the storage action. A request is marked as launched only after its helper starts, so a launch failure or prelaunch cancellation does not imply that storage changed.
 
 **Unmount Volume** is enabled only while the selected volume is mounted and targets that volume alone:
 

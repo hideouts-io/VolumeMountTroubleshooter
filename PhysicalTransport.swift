@@ -72,20 +72,28 @@ enum SelectedMediaPresence: Equatable {
     case unavailable(String)
 }
 
-enum EjectOutcome: Equatable {
-    case success
-    case failed
-    case unverified
-}
-
 enum EjectPhase: Equatable {
     case preflight
     case launching
     case inFlight
+    case postconditionObserved
     case stopped
 }
 
-func ejectOutcome(exitStatus: Int32, mediaPresence: SelectedMediaPresence) -> EjectOutcome {
+/// Stop during optional diagnostics preserves a command/postcondition result already captured.
+func ejectPhaseAfterStop(_ phase: EjectPhase) -> EjectPhase {
+    phase == .postconditionObserved ? phase : .stopped
+}
+
+func completedEjectOutcome(
+    outcome: StorageActionOutcome?,
+    phase: EjectPhase,
+    commandLaunched: Bool
+) -> StorageActionOutcome? {
+    phase == .stopped && commandLaunched ? .unverified : outcome
+}
+
+func ejectOutcome(exitStatus: Int32, mediaPresence: SelectedMediaPresence) -> StorageActionOutcome {
     switch (exitStatus, mediaPresence) {
     case (0, .absent):
         return .success
@@ -102,7 +110,7 @@ func expectedEjectDisappearance(
     disk: ExternalDisk,
     phase: EjectPhase
 ) -> Bool {
-    guard phase == .inFlight else {
+    guard phase == .inFlight || phase == .postconditionObserved else {
         return false
     }
     return deviceIdentifier(volume.identifier, isSameAsOrDescendantOf: identifier)

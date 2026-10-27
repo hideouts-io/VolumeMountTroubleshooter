@@ -7,11 +7,6 @@ private struct MountRequestOutcome {
     let postcondition: StorageStateObservation
 }
 
-private enum StorageStateObservation {
-    case verified(ExternalVolume)
-    case unavailable(String)
-}
-
 private struct ActiveEject {
     let generation: Int
     let volume: ExternalVolume
@@ -524,7 +519,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
             !updatedSnapshot.unlockers.contains(unlocker)
         } ?? false
         let isExpectedEjectDisappearance = selectedWasRemoved && isRunning && activeEject.map { eject in
-            let phase = eject.phase == .launching && runner.isActiveCommand(
+            let phase = eject.phase == .launching && runner.hasLaunchedCommand(
                 executable: "/usr/sbin/diskutil",
                 arguments: ["eject", "/dev/\(eject.disk.identifier)"]
             ) ? EjectPhase.inFlight : eject.phase
@@ -539,7 +534,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
             selectionRequiresUserChoice = true
             if isRunning {
                 if isExpectedEjectDisappearance {
-                    appendLog("EJECT TRANSITION: selected storage disappeared; awaiting the eject command result and original-media verification.\n")
+                    appendLog("EJECT TRANSITION: selected storage disappeared; recording the action result and diagnostic coverage.\n")
                 } else {
                     runner.cancel()
                     appendLog("SELECTED STORAGE DISCONNECTED: stopping the operation; select the device again after it reappears.\n")
@@ -1135,7 +1130,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
         refreshWorkItem = nil
         unlockRetryWorkItem?.cancel()
         unlockRetryWorkItem = nil
-        activeEject?.phase = .stopped
+        if let eject = activeEject {
+            activeEject?.phase = ejectPhaseAfterStop(eject.phase)
+        }
         runner.cancel()
         scanRunner.cancel()
         stopButton?.isEnabled = false
@@ -1207,6 +1204,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
                 runner: runner
             )
             postEjectObservation(presence, devicePath: devicePath)
+            markEjectPostconditionObserved(generation: generation)
             appendOptionalDiskArbitrationErrors(volume: volume, runner: runner)
             if result.exitStatus != 0 {
                 postLog(guidedFailureExplanation(exitStatus: result.exitStatus, output: result.output, volume: volume) + "\n")
@@ -1262,12 +1260,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
     }
 
     nonisolated private func markEjectCommandStarted(generation: Int) {
-        DispatchQueue.main.sync { [weak self] in
+        DispatchQueue.main.async { [weak self] in
             guard let self, var eject = self.activeEject,
                   eject.generation == generation, self.isRunning, eject.phase == .launching else {
                 return
             }
             eject.phase = .inFlight
+            self.activeEject = eject
+        }
+    }
+
+    nonisolated private func markEjectPostconditionObserved(generation: Int) {
+        DispatchQueue.main.sync { [weak self] in
+            guard let self, var eject = self.activeEject,
+                  eject.generation == generation, self.isRunning, eject.phase == .inFlight else {
+                return
+            }
+            eject.phase = .postconditionObserved
             self.activeEject = eject
         }
     }
@@ -1303,7 +1312,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
 
     nonisolated private func postEjectCompletion(
         generation: Int,
-        outcome: EjectOutcome?,
+        outcome: StorageActionOutcome?,
         message: String,
         mutationRequested: Bool
     ) {
@@ -1314,7 +1323,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
 
     private func completeEject(
         generation: Int,
-        outcome: EjectOutcome?,
+        outcome: StorageActionOutcome?,
         message: String,
         mutationRequested: Bool
     ) {
@@ -1322,7 +1331,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
             return
         }
         activeEject = nil
-        let finalOutcome = eject.phase == .stopped && mutationRequested ? .unverified : outcome
+        let finalOutcome = completedEjectOutcome(outcome: outcome, phase: eject.phase, commandLaunched: mutationRequested)
         switch finalOutcome {
         case .success:
             appendLog("\nRESULT: SUCCESS — \(message)\n")
@@ -1463,25 +1472,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
                 throw TroubleshooterError.selectedStorageChanged(reason: "the selected volume's mount or writable state changed before the read-only request")
             }
             if nonEmpty(currentVolume.mountPoint) != nil, currentVolume.isWritable == true {
-                mutationRequested = true
                 let unmount = try runLogged(
                     executable: "/usr/sbin/diskutil",
                     arguments: ["unmount", "/dev/\(volume.identifier)"],
-                    runner: runner
+                    runner: runner,
+                    onLaunch: { mutationRequested = true }
                 )
                 guard unmount.exitStatus == 0 else {
                     postLog(guidedFailureExplanation(exitStatus: unmount.exitStatus, output: unmount.output, volume: volume) + "\n")
                     let postcondition = observeSelectedStorage(volume: volume, disk: disk, runner: runner)
                     postStorageObservation(postcondition)
+                    let result = unmountOutcome(exitStatus: unmount.exitStatus, observation: postcondition)
                     appendOptionalDiskArbitrationErrors(volume: volume, runner: runner)
-                    switch postcondition {
-                    case let .verified(current) where nonEmpty(current.mountPoint) != nil:
-                        finishFailure("Unmount command failed during read-only remount; the selected volume remains mounted")
-                    case .verified:
-                        finishUnverified("Unmount command exited \(unmount.exitStatus), but the volume is now unmounted; read-only mount was not attempted")
-                    case .unavailable:
-                        finishUnverified("Unmount command exited \(unmount.exitStatus); final state unknown and read-only mount was not attempted")
-                    }
+                    finishStorageAction(StorageActionResult(
+                        outcome: result.outcome,
+                        message: result.message + "; read-only mount was not attempted"
+                    ))
                     return
                 }
                 postLog("INTERMEDIATE RESULT: unmount command completed; read-only mount has not yet been verified.\n")
@@ -1493,50 +1499,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
                 finishUnverified("The selected volume was still mounted before the read-only mount request")
                 return
             }
-            mutationRequested = true
             let outcome = try runMountRequest(
                 volume: volume,
                 disk: disk,
                 arguments: ["mount", "readOnly", "/dev/\(volume.identifier)"],
-                runner: runner
+                runner: runner,
+                onLaunch: { mutationRequested = true }
             )
             postStorageObservation(outcome.postcondition)
-            appendOptionalDiskArbitrationErrors(volume: volume, runner: runner)
-
-            guard outcome.mountResult.exitStatus == 0 else {
+            if outcome.mountResult.exitStatus != 0 {
                 postLog(guidedFailureExplanation(exitStatus: outcome.mountResult.exitStatus, output: outcome.mountResult.output, volume: volume) + "\n")
-                switch outcome.postcondition {
-                case let .verified(current) where nonEmpty(current.mountPoint) != nil && current.isWritable == false:
-                    finishUnverified("Read-only state was observed despite mount exit \(outcome.mountResult.exitStatus)")
-                case .verified:
-                    finishFailure("Read-only mount command exited \(outcome.mountResult.exitStatus); the requested state was not observed")
-                case .unavailable:
-                    finishUnverified("Read-only mount command exited \(outcome.mountResult.exitStatus); final state unknown")
-                }
-                return
             }
-            guard case let .verified(currentVolume) = outcome.postcondition else {
-                finishUnverified("Read-only mount command completed, but the final state could not be verified")
-                return
-            }
-            guard let mountPoint = nonEmpty(currentVolume.mountPoint) else {
-                finishUnverified("Read-only mount command completed, but the selected volume is unmounted")
-                return
-            }
-            guard currentVolume.isWritable == false else {
-                let reason = currentVolume.isWritable == true
-                    ? "macOS reports a writable volume despite the read-only request"
-                    : "macOS did not report the volume's writable state"
-                postLog("READ-ONLY VERIFICATION FAILED: \(reason). Check this volume in Disk Utility before using it.\n")
-                finishUnverified("Read-only state was not verified at \(mountPoint)")
-                return
-            }
-
-            postLog("VERIFIED MOUNT: \(mountPoint) (read-only)\n")
-            finishSuccess("Mounted \(volume.name) at \(mountPoint)")
+            let result = readOnlyMountOutcome(exitStatus: outcome.mountResult.exitStatus, observation: outcome.postcondition)
+            appendOptionalDiskArbitrationErrors(volume: volume, runner: runner)
+            finishStorageAction(result)
         } catch TroubleshooterError.cancelled {
             if mutationRequested {
-                finishUnverified("Stopped after a storage command was requested; verify the current volume state")
+                finishUnverified("Stopped after a storage command launched; verify the current volume state")
             } else {
                 finishCancelled()
             }
@@ -1579,42 +1558,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
                 return
             }
 
-            mutationRequested = true
             let outcome = try runMountRequest(
                 volume: volume,
                 disk: disk,
                 arguments: ["mount", "/dev/\(volume.identifier)"],
-                runner: runner
+                runner: runner,
+                onLaunch: { mutationRequested = true }
             )
             postStorageObservation(outcome.postcondition)
-            appendOptionalDiskArbitrationErrors(volume: volume, runner: runner)
-            guard outcome.mountResult.exitStatus == 0 else {
+            if outcome.mountResult.exitStatus != 0 {
                 postLog(guidedFailureExplanation(exitStatus: outcome.mountResult.exitStatus, output: outcome.mountResult.output, volume: volume) + "\n")
-                switch outcome.postcondition {
-                case let .verified(current) where nonEmpty(current.mountPoint) != nil:
-                    finishUnverified("A mount point was observed despite mount exit \(outcome.mountResult.exitStatus)")
-                case .verified:
-                    finishFailure("Normal mount command exited \(outcome.mountResult.exitStatus); the selected volume remains unmounted")
-                case .unavailable:
-                    finishUnverified("Normal mount command exited \(outcome.mountResult.exitStatus); final state unknown")
-                }
-                return
             }
-            guard case let .verified(currentVolume) = outcome.postcondition else {
-                finishUnverified("Normal mount command completed, but the final state could not be verified")
-                return
-            }
-            guard let mountPoint = nonEmpty(currentVolume.mountPoint) else {
-                finishUnverified("Normal mount command completed, but the selected volume is unmounted")
-                return
-            }
-
-            let access = currentVolume.isWritable.map { $0 ? "writable" : "read-only" } ?? "writable state unknown"
-            postLog("VERIFIED MOUNT: \(mountPoint) (\(access))\n")
-            finishSuccess("Mounted \(volume.name) at \(mountPoint) (\(access))")
+            let result = normalMountOutcome(exitStatus: outcome.mountResult.exitStatus, observation: outcome.postcondition)
+            appendOptionalDiskArbitrationErrors(volume: volume, runner: runner)
+            finishStorageAction(result)
         } catch TroubleshooterError.cancelled {
             if mutationRequested {
-                finishUnverified("Stopped after a mount command was requested; verify the current volume state")
+                finishUnverified("Stopped after a mount command launched; verify the current volume state")
             } else {
                 finishCancelled()
             }
@@ -1649,39 +1609,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
         var mutationRequested = false
         do {
             _ = try validatedSelectedVolume(volume: volume, disk: disk, runner: runner)
-            mutationRequested = true
-            let result = try runLogged(
+            let commandResult = try runLogged(
                 executable: "/usr/sbin/diskutil",
                 arguments: ["unmount", "/dev/\(volume.identifier)"],
-                runner: runner
+                runner: runner,
+                onLaunch: { mutationRequested = true }
             )
             let postcondition = observeSelectedStorage(volume: volume, disk: disk, runner: runner)
             postStorageObservation(postcondition)
+            if commandResult.exitStatus != 0 {
+                postLog(guidedFailureExplanation(exitStatus: commandResult.exitStatus, output: commandResult.output, volume: volume) + "\n")
+            }
+            let result = unmountOutcome(exitStatus: commandResult.exitStatus, observation: postcondition)
             appendOptionalDiskArbitrationErrors(volume: volume, runner: runner)
-            guard result.exitStatus == 0 else {
-                postLog(guidedFailureExplanation(exitStatus: result.exitStatus, output: result.output, volume: volume) + "\n")
-                switch postcondition {
-                case let .verified(current) where nonEmpty(current.mountPoint) == nil:
-                    finishUnverified("The volume is unmounted despite unmount exit \(result.exitStatus)")
-                case .verified:
-                    finishFailure("Unmount command exited \(result.exitStatus); the selected volume remains mounted")
-                case .unavailable:
-                    finishUnverified("Unmount command exited \(result.exitStatus); final state unknown")
-                }
-                return
-            }
-            guard case let .verified(currentVolume) = postcondition else {
-                finishUnverified("Unmount command completed, but the final state could not be verified")
-                return
-            }
-            guard nonEmpty(currentVolume.mountPoint) == nil else {
-                finishUnverified("Unmount command completed, but /dev/\(volume.identifier) remains mounted")
-                return
-            }
-            finishSuccess("Unmounted /dev/\(volume.identifier)")
+            finishStorageAction(result)
         } catch TroubleshooterError.cancelled {
             if mutationRequested {
-                finishUnverified("Stopped after an unmount command was requested; verify the current volume state")
+                finishUnverified("Stopped after an unmount command launched; verify the current volume state")
             } else {
                 finishCancelled()
             }
@@ -1772,12 +1716,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
         volume: ExternalVolume,
         disk: ExternalDisk,
         arguments: [String],
-        runner: CommandRunner
+        runner: CommandRunner,
+        onLaunch: () -> Void
     ) throws -> MountRequestOutcome {
         let mountResult = try runLogged(
             executable: "/usr/sbin/diskutil",
             arguments: arguments,
-            runner: runner
+            runner: runner,
+            onLaunch: onLaunch
         )
         return MountRequestOutcome(
             mountResult: mountResult,
@@ -1798,10 +1744,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
     }
 
     nonisolated private func appendOptionalDiskArbitrationErrors(volume: ExternalVolume, runner: CommandRunner) {
-        do {
+        let coverage = collectDiagnosticCoverage {
             try appendDiskArbitrationErrors(volume: volume, runner: runner)
-        } catch {
-            postLog("DIAGNOSTIC COVERAGE UNAVAILABLE: \(error.localizedDescription)\n")
+        }
+        if case let .unavailable(reason) = coverage {
+            postLog("DIAGNOSTIC COVERAGE UNAVAILABLE: \(reason)\n")
         }
     }
 
@@ -1912,6 +1859,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
     nonisolated private func postLog(_ text: String) {
         DispatchQueue.main.async { [weak self] in
             self?.appendLog(text)
+        }
+    }
+
+    nonisolated private func finishStorageAction(_ result: StorageActionResult) {
+        switch result.outcome {
+        case .success:
+            finishSuccess(result.message)
+        case .failed:
+            finishFailure(result.message)
+        case .unverified:
+            finishUnverified(result.message)
         }
     }
 

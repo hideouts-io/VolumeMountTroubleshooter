@@ -5,6 +5,77 @@ struct CommandResult: Sendable {
     let output: String
 }
 
+enum StorageStateObservation: Equatable, Sendable {
+    case verified(ExternalVolume)
+    case unavailable(String)
+}
+
+enum StorageActionOutcome: Equatable, Sendable {
+    case success
+    case failed
+    case unverified
+}
+
+struct StorageActionResult: Equatable, Sendable {
+    let outcome: StorageActionOutcome
+    let message: String
+}
+
+/// Classifies the command and fresh same-media observation independently of optional diagnostics.
+func normalMountOutcome(exitStatus: Int32, observation: StorageStateObservation) -> StorageActionResult {
+    guard case let .verified(volume) = observation else {
+        return StorageActionResult(outcome: .unverified, message: "Normal mount command exited \(exitStatus); final state could not be verified")
+    }
+    let mountPoint = nonEmpty(volume.mountPoint)
+    if exitStatus != 0 {
+        return mountPoint == nil
+            ? StorageActionResult(outcome: .failed, message: "Normal mount command exited \(exitStatus); the selected volume remains unmounted")
+            : StorageActionResult(outcome: .unverified, message: "A mount point was observed despite mount exit \(exitStatus)")
+    }
+    guard let mountPoint else {
+        return StorageActionResult(outcome: .unverified, message: "Normal mount command completed, but the selected volume is unmounted")
+    }
+    let access = volume.isWritable.map { $0 ? "writable" : "read-only" } ?? "writable state unknown"
+    return StorageActionResult(outcome: .success, message: "Mounted \(volume.name) at \(mountPoint) (\(access))")
+}
+
+func readOnlyMountOutcome(exitStatus: Int32, observation: StorageStateObservation) -> StorageActionResult {
+    guard case let .verified(volume) = observation else {
+        return StorageActionResult(outcome: .unverified, message: "Read-only mount command exited \(exitStatus); final state could not be verified")
+    }
+    let mountPoint = nonEmpty(volume.mountPoint)
+    if exitStatus != 0 {
+        return mountPoint != nil && volume.isWritable == false
+            ? StorageActionResult(outcome: .unverified, message: "Read-only state was observed despite mount exit \(exitStatus)")
+            : StorageActionResult(outcome: .failed, message: "Read-only mount command exited \(exitStatus); the requested state was not observed")
+    }
+    guard let mountPoint else {
+        return StorageActionResult(outcome: .unverified, message: "Read-only mount command completed, but the selected volume is unmounted")
+    }
+    guard volume.isWritable == false else {
+        let reason = volume.isWritable == true
+            ? "macOS reports a writable volume despite the read-only request"
+            : "macOS did not report the volume's writable state"
+        return StorageActionResult(outcome: .unverified, message: "Read-only state was not verified at \(mountPoint): \(reason)")
+    }
+    return StorageActionResult(outcome: .success, message: "Mounted \(volume.name) at \(mountPoint) (read-only)")
+}
+
+func unmountOutcome(exitStatus: Int32, observation: StorageStateObservation) -> StorageActionResult {
+    guard case let .verified(volume) = observation else {
+        return StorageActionResult(outcome: .unverified, message: "Unmount command exited \(exitStatus); final state could not be verified")
+    }
+    let isUnmounted = nonEmpty(volume.mountPoint) == nil
+    if exitStatus != 0 {
+        return isUnmounted
+            ? StorageActionResult(outcome: .unverified, message: "The volume is unmounted despite unmount exit \(exitStatus)")
+            : StorageActionResult(outcome: .failed, message: "Unmount command exited \(exitStatus); the selected volume remains mounted")
+    }
+    return isUnmounted
+        ? StorageActionResult(outcome: .success, message: "Unmounted /dev/\(volume.identifier)")
+        : StorageActionResult(outcome: .unverified, message: "Unmount command completed, but /dev/\(volume.identifier) remains mounted")
+}
+
 struct ExternalVolume: Hashable, Sendable {
     let identifier: String
     let wholeDiskIdentifier: String
@@ -1174,7 +1245,7 @@ func runSelfTests() -> Bool {
     let report = "USB Serial Number: ABC123\nVolume UUID: 12345678-1234-1234-1234-123456789ABC"
     let redacted = privacyRedactedReport(report, userName: "tester")
     return !redacted.contains("ABC123") && !redacted.contains("12345678-1234")
-        && runTransportSelfTests() && runStorageObservationSelfTests()
+        && runTransportSelfTests() && runStorageObservationSelfTests() && runStorageActionOutcomeSelfTests()
 }
 
 private func runStorageObservationSelfTests() -> Bool {
