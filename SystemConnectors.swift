@@ -61,6 +61,8 @@ private final class CommandOutputBuffer: @unchecked Sendable {
     }
 }
 
+private let maximumCommandOutputBytes = 4_194_304
+
 private struct CommandLaunchReceipt {
     let executable: String
     let arguments: [String]
@@ -261,6 +263,7 @@ private func collectCommandOutput(
 ) -> TroubleshooterError? {
     let deadline = ProcessInfo.processInfo.systemUptime + timeoutSeconds
     var reachedEOF = false
+    var capturedBytes = 0
     var bytes = [UInt8](repeating: 0, count: 65_536)
     while true {
         if isCancelled() {
@@ -308,6 +311,13 @@ private func collectCommandOutput(
             reachedEOF = true
             continue
         }
+        guard count <= maximumCommandOutputBytes - capturedBytes else {
+            return .commandOutputFailed(
+                command: command,
+                reason: "Output exceeded the 4 MiB command limit; collection stopped and incomplete output was not used."
+            )
+        }
+        capturedBytes += count
         let chunk = outputBuffer.append(Data(bytes.prefix(count)))
         if !chunk.isEmpty {
             onOutput(chunk)
@@ -459,6 +469,42 @@ func runCommandRunnerSelfTests() -> Bool {
               bulk.output == String(repeating: "x", count: 131_072),
               try bulkStream.value(command: "complete pipe drain self-test") == bulk.output else {
             throw TroubleshooterError.invalidCommandOutput(command: "complete pipe drain self-test", reason: "Buffered output was truncated or streaming disagreed with captured output")
+        }
+
+        let exactLimit = try runner.run(
+            executable: "/usr/bin/awk",
+            arguments: ["BEGIN { for (i = 0; i < 4096; i++) printf \"%01024d\", 0 }"],
+            timeoutSeconds: 5
+        ) { _ in }
+        guard exactLimit.exitStatus == 0, exactLimit.output.utf8.count == maximumCommandOutputBytes else {
+            throw TroubleshooterError.invalidCommandOutput(command: "command output limit self-test", reason: "Output at the exact limit did not complete")
+        }
+        var streamedOverflowBytes = 0
+        do {
+            _ = try runner.run(
+                executable: "/usr/bin/awk",
+                arguments: ["BEGIN { for (i = 0; i < 4096; i++) printf \"%01024d\", 0; printf \"x\" }"],
+                timeoutSeconds: 5
+            ) { chunk in
+                streamedOverflowBytes += chunk.utf8.count
+            }
+            throw TroubleshooterError.invalidCommandOutput(command: "command output overflow self-test", reason: "Oversized output was accepted")
+        } catch TroubleshooterError.commandOutputFailed(_, let reason) {
+            guard reason.contains("4 MiB command limit"), streamedOverflowBytes <= maximumCommandOutputBytes else {
+                throw TroubleshooterError.invalidCommandOutput(command: "command output overflow self-test", reason: "Overflow lacked a bounded explicit failure")
+            }
+        }
+        do {
+            _ = try runner.run(executable: "/usr/bin/yes", arguments: ["x"], timeoutSeconds: 5) { _ in }
+            throw TroubleshooterError.invalidCommandOutput(command: "active helper overflow self-test", reason: "An unbounded helper unexpectedly completed")
+        } catch TroubleshooterError.commandOutputFailed(_, let reason) {
+            guard reason.contains("4 MiB command limit") else {
+                throw TroubleshooterError.invalidCommandOutput(command: "active helper overflow self-test", reason: "The helper failed for a reason other than the output limit")
+            }
+        }
+        let afterOverflow = try runner.run(executable: "/usr/bin/true", arguments: [], timeoutSeconds: 5) { _ in }
+        guard afterOverflow.exitStatus == 0 else {
+            throw TroubleshooterError.invalidCommandOutput(command: "command output overflow self-test", reason: "The helper did not exit or the runner could not be reused")
         }
 
         let heldStream = CommandOutputBuffer()
