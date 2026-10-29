@@ -5,6 +5,144 @@ struct CommandResult: Sendable {
     let output: String
 }
 
+let maximumReportBytes = 1_048_576
+
+struct BoundedDiagnosticLog: Sendable {
+    static let omissionNotice = "[Earlier diagnostic output omitted to keep this report bounded.]\n"
+    static let empty = BoundedDiagnosticLog(content: "", omittedEarlierContent: false, droppingPartialLine: false)
+
+    let content: String
+    let omittedEarlierContent: Bool
+    let droppingPartialLine: Bool
+
+    var rendered: String {
+        (omittedEarlierContent ? Self.omissionNotice : "") + content
+    }
+
+    var isEmpty: Bool {
+        content.isEmpty && !omittedEarlierContent
+    }
+
+    func appending(_ text: String, maximumBytes: Int) -> BoundedDiagnosticLog {
+        precondition(maximumBytes > Self.omissionNotice.utf8.count)
+        let nextText: String
+        if droppingPartialLine {
+            guard let newline = text.firstIndex(of: "\n") else { return self }
+            nextText = String(text[text.index(after: newline)...])
+        } else {
+            nextText = text
+        }
+        let combined = content + nextText
+        let noticeBytes = omittedEarlierContent ? Self.omissionNotice.utf8.count : 0
+        if noticeBytes + combined.utf8.count <= maximumBytes {
+            return BoundedDiagnosticLog(content: combined, omittedEarlierContent: omittedEarlierContent, droppingPartialLine: false)
+        }
+
+        let utf8 = combined.utf8
+        var start = utf8.index(utf8.endIndex, offsetBy: -(maximumBytes - Self.omissionNotice.utf8.count))
+        while start != utf8.endIndex, utf8[start] & 0xC0 == 0x80 {
+            start = utf8.index(after: start)
+        }
+        let startsAtLine = start == utf8.startIndex || utf8[utf8.index(before: start)] == 0x0A
+        let suffix = String(decoding: utf8[start...], as: UTF8.self)
+        let retained: String
+        let dropsPartialLine: Bool
+        if startsAtLine {
+            retained = suffix
+            dropsPartialLine = false
+        } else if let newline = suffix.firstIndex(of: "\n") {
+            retained = String(suffix[suffix.index(after: newline)...])
+            dropsPartialLine = false
+        } else {
+            retained = ""
+            dropsPartialLine = true
+        }
+        return BoundedDiagnosticLog(content: retained, omittedEarlierContent: true, droppingPartialLine: dropsPartialLine)
+    }
+
+    func appendingEntry(_ text: String, maximumBytes: Int) -> BoundedDiagnosticLog {
+        let prior = BoundedDiagnosticLog(
+            content: content,
+            omittedEarlierContent: omittedEarlierContent,
+            droppingPartialLine: false
+        )
+        let updated = prior.appending(text, maximumBytes: maximumBytes)
+        return BoundedDiagnosticLog(
+            content: updated.content,
+            omittedEarlierContent: updated.omittedEarlierContent,
+            droppingPartialLine: droppingPartialLine
+        )
+    }
+}
+
+func boundedSharedReport(_ report: String, header: String) -> String {
+    precondition(report.hasPrefix(header))
+    let body = String(report.dropFirst(header.count))
+    let bounded = BoundedDiagnosticLog.empty.appending(
+        body,
+        maximumBytes: maximumReportBytes - header.utf8.count
+    )
+    return header + bounded.rendered
+}
+
+func runBoundedDiagnosticLogSelfTests() -> Bool {
+    let limit = 128
+    let first = BoundedDiagnosticLog.empty.appending("first line\n", maximumBytes: limit)
+    let repeated = first.appending(
+        String(repeating: "old diagnostic line\n", count: 20),
+        maximumBytes: limit
+    )
+    let final = repeated.appending("RESULT: FAILED — current state is known\n", maximumBytes: limit)
+    let unicode = BoundedDiagnosticLog.empty.appending(
+        String(repeating: "💾 diagnostic line\n", count: 20),
+        maximumBytes: limit
+    )
+    let singleLongLine = BoundedDiagnosticLog.empty.appending(
+        String(repeating: "x", count: 1_000),
+        maximumBytes: limit
+    ).appending("hidden continuation", maximumBytes: limit)
+        .appending("\nRESULT: UNVERIFIED\n", maximumBytes: limit)
+    let standaloneError = BoundedDiagnosticLog.empty.appending(
+        String(repeating: "x", count: 1_000),
+        maximumBytes: limit
+    ).appendingEntry("REPORT SAVE FAILED: destination unavailable\n", maximumBytes: limit)
+    let interleaved = BoundedDiagnosticLog.empty.appending(
+        String(repeating: "x", count: 1_000),
+        maximumBytes: limit
+    ).appendingEntry("AUTO-DETECT: device changed\n", maximumBytes: limit)
+        .appending("hidden continuation", maximumBytes: limit)
+        .appending("\nRESULT: UNVERIFIED\n", maximumBytes: limit)
+    let commandEnded = BoundedDiagnosticLog.empty.appending(
+        String(repeating: "x", count: 1_000),
+        maximumBytes: limit
+    ).appending("\n", maximumBytes: limit)
+        .appending("next command output\n", maximumBytes: limit)
+    let reportHeader = "Privacy redaction: disabled\n\n"
+    let shared = boundedSharedReport(
+        reportHeader + String(repeating: "old diagnostic line\n", count: 70_000) + "RESULT: FAILED\n",
+        header: reportHeader
+    )
+    return first.rendered == "first line\n"
+        && !first.omittedEarlierContent
+        && final.rendered.utf8.count <= limit
+        && final.rendered.hasPrefix(BoundedDiagnosticLog.omissionNotice)
+        && !final.rendered.contains("first line")
+        && final.rendered.contains("RESULT: FAILED — current state is known")
+        && unicode.rendered.utf8.count <= limit
+        && !unicode.rendered.contains("�")
+        && singleLongLine.rendered.utf8.count <= limit
+        && !singleLongLine.rendered.contains("hidden continuation")
+        && singleLongLine.rendered.contains("RESULT: UNVERIFIED")
+        && standaloneError.rendered.contains("REPORT SAVE FAILED: destination unavailable")
+        && interleaved.rendered.contains("AUTO-DETECT: device changed")
+        && !interleaved.rendered.contains("hidden continuation")
+        && interleaved.rendered.contains("RESULT: UNVERIFIED")
+        && commandEnded.rendered.contains("next command output")
+        && shared.hasPrefix(reportHeader + BoundedDiagnosticLog.omissionNotice)
+        && shared.utf8.count <= maximumReportBytes
+        && shared.contains("RESULT: FAILED")
+}
+
 enum StorageStateObservation: Equatable, Sendable {
     case verified(ExternalVolume)
     case unavailable(String)

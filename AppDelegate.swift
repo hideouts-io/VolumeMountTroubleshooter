@@ -20,10 +20,117 @@ private enum WorkbenchToolbarItem {
     static let reveal = NSToolbarItem.Identifier("revealVolumes")
 }
 
+private final class PendingLogDelivery: @unchecked Sendable {
+    private let lock = NSLock()
+    private var pending = BoundedDiagnosticLog.empty
+    private var scheduled = false
+    private var generation = 0
+
+    func enqueue(_ text: String) -> Int? {
+        lock.lock()
+        defer { lock.unlock() }
+        pending = pending.appending(text, maximumBytes: maximumReportBytes)
+        guard !pending.isEmpty, !scheduled else { return nil }
+        scheduled = true
+        generation += 1
+        return generation
+    }
+
+    func take(generation expected: Int) -> String? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard scheduled, generation == expected else { return nil }
+        let result = pending.rendered
+        pending = BoundedDiagnosticLog(
+            content: "",
+            omittedEarlierContent: false,
+            droppingPartialLine: pending.droppingPartialLine
+        )
+        scheduled = false
+        return result
+    }
+
+    func snapshot() -> String {
+        lock.lock()
+        defer { lock.unlock() }
+        let result = pending.rendered
+        pending = BoundedDiagnosticLog(
+            content: "",
+            omittedEarlierContent: false,
+            droppingPartialLine: pending.droppingPartialLine
+        )
+        scheduled = false
+        generation += 1
+        return result
+    }
+
+    func endOutput() {
+        lock.lock()
+        pending = BoundedDiagnosticLog(
+            content: pending.content,
+            omittedEarlierContent: pending.omittedEarlierContent,
+            droppingPartialLine: false
+        )
+        lock.unlock()
+    }
+}
+
+func runPendingLogDeliverySelfTests() -> Bool {
+    let delivery = PendingLogDelivery()
+    guard let firstToken = delivery.enqueue("first"),
+          delivery.enqueue(" second") == nil,
+          delivery.take(generation: firstToken) == "first second",
+          let boundedToken = delivery.enqueue(String(repeating: "old diagnostic line\n", count: 70_000)),
+          delivery.enqueue("RESULT: UNVERIFIED\n") == nil,
+          let bounded = delivery.take(generation: boundedToken) else {
+        return false
+    }
+    let splitLine = PendingLogDelivery()
+    guard let firstChunkToken = splitLine.enqueue(String(repeating: "x", count: maximumReportBytes + 1)),
+          let firstChunk = splitLine.take(generation: firstChunkToken) else {
+        return false
+    }
+    let continuationToken = splitLine.enqueue("hidden continuation")
+    guard let finalChunkToken = splitLine.enqueue("\nRESULT: FAILED\n"),
+          let finalChunk = splitLine.take(generation: finalChunkToken) else {
+        return false
+    }
+    let endedLine = PendingLogDelivery()
+    guard let endedLineToken = endedLine.enqueue(String(repeating: "x", count: maximumReportBytes + 1)),
+          let endedLineNotice = endedLine.take(generation: endedLineToken) else {
+        return false
+    }
+    endedLine.endOutput()
+    guard let nextCommandToken = endedLine.enqueue("next command output\n"),
+          let nextCommandOutput = endedLine.take(generation: nextCommandToken) else {
+        return false
+    }
+    let ordering = PendingLogDelivery()
+    guard let oldToken = ordering.enqueue("command A output") else { return false }
+    let snapshot = ordering.snapshot()
+    let invalidatedOldDrain = ordering.take(generation: oldToken) == nil
+    guard let newToken = ordering.enqueue("command B output"),
+          let newOutput = ordering.take(generation: newToken) else { return false }
+    return bounded.utf8.count <= maximumReportBytes
+        && bounded.hasPrefix(BoundedDiagnosticLog.omissionNotice)
+        && bounded.contains("RESULT: UNVERIFIED")
+        && delivery.enqueue("next") != nil
+        && firstChunk == BoundedDiagnosticLog.omissionNotice
+        && continuationToken == nil
+        && finalChunk == "RESULT: FAILED\n"
+        && endedLineNotice == BoundedDiagnosticLog.omissionNotice
+        && nextCommandOutput == "next command output\n"
+        && snapshot == "command A output"
+        && invalidatedOldDrain
+        && newOutput == "command B output"
+}
+
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
     private let runner = CommandRunner()
     private let scanRunner = CommandRunner()
+    private let pendingLog = PendingLogDelivery()
+    private let logPostLock = NSLock()
     private let unlockRetryLimit = 5
     private let unlockRetryDelay: TimeInterval = 2
     private var diskMonitor: DiskEventMonitor?
@@ -50,7 +157,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
     private var copyButton: NSButton?
     private var saveButton: NSButton?
     private var revealButton: NSButton?
-    private var completeLog = ""
+    private var completeLog = BoundedDiagnosticLog.empty
     private var isRunning = false
     private var operationGeneration = 0
     private var activeEject: ActiveEject?
@@ -1099,7 +1206,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
         operationGeneration += 1
         activeEject = nil
         isRunning = true
-        completeLog = ""
+        completeLog = .empty
         textView?.string = ""
         runner.reset()
         setControlsForRunningState(true)
@@ -1389,9 +1496,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
 
     private func reportForSharing() -> String {
         guard redactCheckbox?.state == .on else {
-            return "Privacy redaction: disabled\n\n\(completeLog)"
+            let header = "Privacy redaction: disabled\n\n"
+            return boundedSharedReport(header + completeLog.rendered, header: header)
         }
-        return privacyRedactedReport(completeLog, userName: NSUserName())
+        let header = "Privacy redaction: enabled\n\n"
+        let redacted = privacyRedactedReport(completeLog.rendered, userName: NSUserName())
+        return boundedSharedReport(redacted, header: header)
     }
 
     @objc private func showUnlockerInFinder() {
@@ -1817,17 +1927,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
     ) throws -> CommandResult {
         let command = renderedCommand(executable: executable, arguments: arguments)
         postLog("$ \(command)\n")
-        let result = try runner.run(
-            executable: executable,
-            arguments: arguments,
-            timeoutSeconds: 30,
-            onLaunch: onLaunch,
-            onOutput: { [weak self] chunk in
-                self?.postLog(chunk)
-            }
-        )
+        var lastOutputEndedInNewline = true
+        let result: CommandResult
+        do {
+            result = try runner.run(
+                executable: executable,
+                arguments: arguments,
+                timeoutSeconds: 30,
+                onLaunch: onLaunch,
+                onOutput: { [weak self] chunk in
+                    lastOutputEndedInNewline = chunk.hasSuffix("\n")
+                    self?.postCommandOutput(chunk)
+                }
+            )
+        } catch {
+            if !lastOutputEndedInNewline { postCommandOutputEnd() }
+            throw error
+        }
         if !result.output.hasSuffix("\n") {
-            postLog("\n")
+            postCommandOutputEnd()
         }
         postLog("[exit status: \(result.exitStatus)]\n\n")
         return result
@@ -1857,8 +1975,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
     }
 
     nonisolated private func postLog(_ text: String) {
+        logPostLock.lock()
+        defer { logPostLock.unlock() }
+        let pending = pendingLog.snapshot()
         DispatchQueue.main.async { [weak self] in
-            self?.appendLog(text)
+            guard let self else { return }
+            if !pending.isEmpty { self.appendOutput(pending) }
+            self.appendLog(text)
+        }
+    }
+
+    nonisolated private func postCommandOutput(_ text: String) {
+        logPostLock.lock()
+        defer { logPostLock.unlock() }
+        guard let generation = pendingLog.enqueue(text) else { return }
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            if let pending = self.pendingLog.take(generation: generation), !pending.isEmpty {
+                self.appendOutput(pending)
+            }
+        }
+    }
+
+    nonisolated private func postCommandOutputEnd() {
+        logPostLock.lock()
+        defer { logPostLock.unlock() }
+        let pending = pendingLog.snapshot()
+        pendingLog.endOutput()
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            if !pending.isEmpty { self.appendOutput(pending) }
+            self.appendOutput("\n")
         }
     }
 
@@ -1902,14 +2049,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
     }
 
     private func appendLog(_ text: String) {
-        completeLog.append(text)
+        displayLog(completeLog.appendingEntry(text, maximumBytes: maximumReportBytes), appended: text)
+    }
+
+    private func appendOutput(_ text: String) {
+        displayLog(completeLog.appending(text, maximumBytes: maximumReportBytes), appended: text)
+    }
+
+    private func displayLog(_ updated: BoundedDiagnosticLog, appended text: String) {
+        completeLog = updated
         guard let textView else {
             return
         }
-        textView.textStorage?.append(NSAttributedString(string: text, attributes: [
+        let attributes: [NSAttributedString.Key: Any] = [
             .font: NSFont.monospacedSystemFont(ofSize: 12, weight: .regular),
             .foregroundColor: NSColor.labelColor
-        ]))
+        ]
+        if updated.omittedEarlierContent {
+            textView.textStorage?.setAttributedString(NSAttributedString(string: updated.rendered, attributes: attributes))
+        } else {
+            textView.textStorage?.append(NSAttributedString(string: text, attributes: attributes))
+        }
         textView.scrollToEndOfDocument(nil)
     }
 

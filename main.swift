@@ -6,7 +6,8 @@ struct VolumeMountTroubleshooterApplication {
     @MainActor
     static func main() {
         if CommandLine.arguments.dropFirst() == ["--self-test"] {
-            guard runSelfTests(), runCommandRunnerSelfTests() else {
+            guard runSelfTests(), runBoundedDiagnosticLogSelfTests(), runPendingLogDeliverySelfTests(),
+                  runCommandRunnerSelfTests() else {
                 FileHandle.standardError.write(Data("Self-test failed\n".utf8))
                 exit(1)
             }

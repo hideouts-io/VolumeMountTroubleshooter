@@ -539,6 +539,8 @@ Inspect renders fresh selected-volume and whole-disk observations as a compact s
 
 Disabling report redaction is an explicit user choice. Reports are written only to the destination selected in the standard macOS save panel.
 
+The app stops collection and terminates a still-running helper if its combined output exceeds 4 MiB; incomplete structured output is never parsed. The live console and copied or saved report retain at most 1 MiB of recent complete lines, with a visible notice when earlier diagnostics were omitted. Copy and Save use the same bounded report.
+
 The app does not transmit reports, telemetry, disk metadata, or credentials over the network.
 
 ---
